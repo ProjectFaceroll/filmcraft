@@ -264,7 +264,39 @@ pub fn mjpeg_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     matches!(e.codec, CodecConfig::Jpeg { .. }).then(|| Ok(Box::new(MjpegDecoder) as Box<dyn VideoDecoder>))
 }
 
-/// Our pure-Rust H.264 decoder (frame-threaded).
+/// Whether an SPS NAL unit declares one of H.264's intra profiles: `constraint_set3_flag` with
+/// profile_idc 44, 100, 110, 122 or 244 (7.4.2.1.1: CAVLC 4:4:4 Intra, High 10 Intra, High 4:2:2
+/// Intra, High 4:4:4 Intra; A.2.8–A.2.11). Every picture of such a stream is intra coded and no
+/// picture references another, so each access unit decodes on its own (XAVC Intra, AVC-Intra).
+fn sps_intra_profile(sps_nal: &[u8]) -> bool {
+    let Some(rbsp) = sps_nal.get(1..) else { return false };
+    filmcraft_h264::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(rbsp))
+        .is_ok_and(|s| matches!(s.profile_idc, 44 | 100 | 110 | 122 | 244) && s.constraint_flags & 0x10 != 0)
+}
+
+/// Whether the SPS of an `avcC` record declares an intra profile ([`sps_intra_profile`]).
+fn avcc_intra_profile(avcc: &[u8]) -> bool {
+    let count = avcc.get(5).map_or(0, |b| (b & 0x1f) as usize);
+    let mut pos = 6usize;
+    for _ in 0..count {
+        let Some(len) = avcc.get(pos..pos.saturating_add(2)).map(|l| u16::from_be_bytes([l[0], l[1]]) as usize) else { return false };
+        pos = pos.saturating_add(2);
+        let Some(nal) = avcc.get(pos..pos.saturating_add(len)) else { return false };
+        if nal.first().is_some_and(|h| h & 0x1f == 7) {
+            return sps_intra_profile(nal);
+        }
+        pos = pos.saturating_add(len);
+    }
+    false
+}
+
+/// Whether an Annex B sample carries an SPS that declares an intra profile ([`sps_intra_profile`]).
+fn annexb_intra_profile(sample: &[u8]) -> bool {
+    filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| h & 0x1f == 7) && sps_intra_profile(n))
+}
+
+/// Our pure-Rust H.264 decoder: frame-threaded, except for intra-profile streams, which it decodes
+/// one access unit at a time on the calling thread (see [`VideoDecoder::intra_only`]).
 pub struct H264Decoder {
     avcc: Vec<u8>,
     dec: filmcraft_h264::Decoder,
@@ -272,12 +304,23 @@ pub struct H264Decoder {
     draft: bool,
     /// Worker threads (a background decoder gets fewer).
     threads: usize,
+    /// The stream's SPS declares an intra profile ([`sps_intra_profile`]): every access unit is
+    /// decoded on its own, with the decoder reset before it, so frames can be decoded in any
+    /// order and in parallel by separate instances. Frame threading would only add the latency
+    /// of the pictures in flight (a 4K picture per thread) to every frame.
+    intra: bool,
 }
 
 impl H264Decoder {
     /// The worker threads for a decoder made now.
-    fn threads_now() -> usize {
-        if filmcraft_media::cancel::background() { BACKGROUND_H264_THREADS.min(h264_threads()) } else { h264_threads() }
+    fn threads_now(intra: bool) -> usize {
+        if intra {
+            1
+        } else if filmcraft_media::cancel::background() {
+            BACKGROUND_H264_THREADS.min(h264_threads())
+        } else {
+            h264_threads()
+        }
     }
 
     fn make_inner(avcc: &[u8], threads: usize) -> Result<filmcraft_h264::Decoder> {
@@ -290,16 +333,24 @@ impl H264Decoder {
 
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
         recycle_h264_planes();
-        let threads = Self::threads_now();
+        let intra = avcc_intra_profile(&avcc);
+        let threads = Self::threads_now(intra);
         let dec = Self::make_inner(&avcc, threads)?;
         let length_size = avcc_length_size(&avcc);
-        Ok(Self { avcc, dec, length_size, draft: false, threads })
+        Ok(Self { avcc, dec, length_size, draft: false, threads, intra })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
     pub fn annexb() -> Self {
+        Self::annexb_for(&[])
+    }
+    /// [`Self::annexb`] for a stream whose first sample is `first`: its SPS tells whether the
+    /// stream is an intra profile (AVC-Intra, XAVC Intra in MXF), which decodes a picture at a
+    /// time ([`VideoDecoder::intra_only`]). Without an SPS in it, a frame-threaded decoder.
+    pub fn annexb_for(first: &[u8]) -> Self {
         recycle_h264_planes();
-        let threads = Self::threads_now();
-        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::with_threads(threads), length_size: 0, draft: false, threads }
+        let intra = annexb_intra_profile(first);
+        let threads = Self::threads_now(intra);
+        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::with_threads(threads), length_size: 0, draft: false, threads, intra }
     }
     /// Tightly packed frame from a decoded picture: 8-bit pictures as `Yuv8`, higher bit depths (`Picture::wide`) as `Yuv16`, 4:2:0 or 4:2:2 chroma.
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
@@ -348,6 +399,15 @@ fn h264_error(e: filmcraft_h264::Error) -> CodecError {
 
 impl VideoDecoder for H264Decoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
+        if self.intra {
+            // Each access unit stands alone: nothing before it is a reference, and nothing after
+            // it waits for it, so the picture comes out of this call. The reset keeps a damaged
+            // or out-of-order previous sample (frame_num gaps) from touching this one.
+            self.reset();
+            let mut pics = self.dec.decode(sample, pts).map_err(h264_error)?;
+            pics.extend(self.dec.flush());
+            return Ok(pics.into_iter().map(Self::convert).collect());
+        }
         let pics = self.dec.decode(sample, pts).map_err(h264_error)?;
         Ok(pics.into_iter().map(Self::convert).collect())
     }
@@ -363,8 +423,11 @@ impl VideoDecoder for H264Decoder {
     fn name(&self) -> &str {
         "FilmCraft H.264"
     }
+    fn intra_only(&self) -> bool {
+        self.intra
+    }
     fn thread_limited(&self) -> bool {
-        self.threads < h264_threads()
+        !self.intra && self.threads < h264_threads()
     }
     fn set_draft(&mut self, on: bool) {
         self.draft = on;
@@ -397,9 +460,16 @@ fn recycle_h264_planes() {
     filmcraft_h264::set_plane_allocator_u16(filmcraft_frame::pool::take_u16);
 }
 
-/// Worker threads each H.264 decoder uses (frame threading; 1 on wasm).
+/// A frame-threaded H.264 decoder outputs a picture only `threads + 2` samples after it was
+/// fed: at 16 threads that is 18 pictures, 360 ms at 50 fps, more than playback prefetches
+/// ahead (14 frames), so every frame came too late. 8 threads decoded 4K 4:2:2 10-bit long-GOP
+/// as fast as 16 on an 8-core / 16-thread CPU (the extra threads share cores) at half the
+/// latency.
+const MAX_H264_THREADS: usize = 8;
+
+/// Worker threads each H.264 decoder uses (frame threading; 1 on wasm), see [`MAX_H264_THREADS`].
 pub fn h264_threads() -> usize {
-    filmcraft_h264::default_threads()
+    filmcraft_h264::default_threads().min(MAX_H264_THREADS)
 }
 
 pub fn h264_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {

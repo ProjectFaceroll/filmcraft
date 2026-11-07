@@ -434,7 +434,8 @@ impl VideoSamples for MxfVideo<'_> {
         let v = self.src.info.video.as_ref().ok_or_else(|| CodecError::Unsupported("no video track".into()))?;
         let (w, h) = (v.width.min(u16::MAX as u32) as u16, v.height.min(u16::MAX as u32) as u16);
         match t.codec {
-            Codec::Avc { .. } => Ok(Box::new(crate::video::H264Decoder::annexb())),
+            // the first sample's SPS says whether the stream is an intra profile (AVC-Intra, XAVC Intra)
+            Codec::Avc { .. } => Ok(Box::new(crate::video::H264Decoder::annexb_for(&self.read(0).unwrap_or_default()))),
             Codec::Mpeg2 => Ok(Box::new(crate::video::Mpeg2Decoder::new(self.src.mpeg2_header.clone()))),
             Codec::Vc3 => make_video_decoder(&SampleEntry::dnx(FourCc(*b"AVdh"), w, h)),
             Codec::ProRes { profile } => make_video_decoder(&SampleEntry::prores(prores_fourcc(profile), w, h)),
