@@ -1,5 +1,5 @@
-//! High 10 / High 4:2:2 (Intra) streams: bit-exactness against ffmpeg's decoder on libx264
-//! fixtures with 4:2:2 and/or 10-bit samples (skipped when ffmpeg is absent).
+//! High 10 / High 4:2:2 streams (intra and long-GOP inter): bit-exactness against ffmpeg's decoder
+//! on libx264 fixtures with 4:2:2 and/or 10-bit samples (skipped when ffmpeg is absent).
 
 use crate::common;
 
@@ -16,7 +16,14 @@ struct HbdFixture {
     /// libx264 / ffmpeg pixel format (yuv420p10le, yuv422p10le, yuv422p).
     pix_fmt: &'static str,
     args: &'static [&'static str],
+    /// Filters between the test source and the pixel format conversion: `zoompan` gives every
+    /// block sub-sample motion (fractional chroma vectors) and vectors pointing outside the picture.
+    motion: &'static str,
 }
+
+/// Slow zoom and diagonal pan for [`HbdFixture::motion`].
+/// The output size is appended from the fixture (`zoompan` defaults to 1280x720).
+const ZOOM_PAN: &str = "zoompan=z='1+0.006*on':x='iw/2-iw/zoom/2+on*0.37':y='ih/2-ih/zoom/2+on*0.61':d=1:fps=25";
 
 const FIXTURES: &[HbdFixture] = &[
     // XAVC Intra-like: High 4:2:2 Intra, 10-bit, CABAC, 8x8 transform, several slices
@@ -27,6 +34,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 6,
         pix_fmt: "yuv422p10le",
         args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=4"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_422p10_intra_cavlc",
@@ -35,6 +43,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 6,
         pix_fmt: "yuv422p10le",
         args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=0"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_422p10_intra_qp_low",
@@ -43,6 +52,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 4,
         pix_fmt: "yuv422p10le",
         args: &["-profile:v", "high422", "-qp", "1", "-x264-params", "keyint=1"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_422p10_intra_qp_high",
@@ -51,6 +61,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 4,
         pix_fmt: "yuv422p10le",
         args: &["-profile:v", "high422", "-qp", "60", "-x264-params", "keyint=1:chroma-qp-offset=4"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_422p10_intra_no8x8",
@@ -59,6 +70,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 4,
         pix_fmt: "yuv422p10le",
         args: &["-profile:v", "high422", "-x264-params", "keyint=1:8x8dct=0:cqm=jvt"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_422p8_intra",
@@ -67,6 +79,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 4,
         pix_fmt: "yuv422p",
         args: &["-profile:v", "high422", "-x264-params", "keyint=1"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_422p8_intra_cavlc",
@@ -75,6 +88,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 4,
         pix_fmt: "yuv422p",
         args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=0"],
+        motion: "",
     },
     // High 10: inter prediction with B-frames, weighted prediction
     HbdFixture {
@@ -84,6 +98,7 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 20,
         pix_fmt: "yuv420p10le",
         args: &["-profile:v", "high10", "-x264-params", "bframes=3:weightp=2:ref=3"],
+        motion: "",
     },
     HbdFixture {
         name: "hbd_420p10_inter_cavlc",
@@ -92,6 +107,91 @@ const FIXTURES: &[HbdFixture] = &[
         frames: 12,
         pix_fmt: "yuv420p10le",
         args: &["-profile:v", "high10", "-x264-params", "cabac=0:bframes=2"],
+        motion: "",
+    },
+    // High 4:2:2 long-GOP (Sony XAVC S 4:2:2 10-bit and the like): P and B pictures with 4:2:2 chroma
+    // motion compensation, weighted prediction and inter deblocking of the 4:2:2 chroma edges
+    HbdFixture {
+        name: "hbd_422p10_inter",
+        width: 352,
+        height: 288,
+        frames: 20,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-x264-params", "bframes=3:weightp=2:ref=3"],
+        motion: "",
+    },
+    HbdFixture {
+        name: "hbd_422p10_inter_cavlc",
+        width: 176,
+        height: 144,
+        frames: 12,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-x264-params", "cabac=0:bframes=2"],
+        motion: "",
+    },
+    HbdFixture {
+        name: "hbd_422p8_inter",
+        width: 352,
+        height: 288,
+        frames: 16,
+        pix_fmt: "yuv422p",
+        args: &["-profile:v", "high422", "-x264-params", "bframes=2:ref=2"],
+        motion: ZOOM_PAN,
+    },
+    HbdFixture {
+        name: "hbd_422p10_inter_motion",
+        width: 352,
+        height: 288,
+        frames: 24,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-x264-params", "bframes=3:ref=3:subme=9:me=umh:merange=32:weightp=2"],
+        motion: ZOOM_PAN,
+    },
+    HbdFixture {
+        name: "hbd_422p10_inter_temporal_direct",
+        width: 176,
+        height: 144,
+        frames: 16,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-x264-params", "bframes=3:direct=temporal:weightb=1:b-pyramid=normal:ref=4"],
+        motion: ZOOM_PAN,
+    },
+    HbdFixture {
+        name: "hbd_422p10_inter_no8x8_cqm",
+        width: 176,
+        height: 144,
+        frames: 12,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-x264-params", "bframes=2:8x8dct=0:cqm=jvt"],
+        motion: ZOOM_PAN,
+    },
+    HbdFixture {
+        name: "hbd_422p10_inter_qp_low",
+        width: 176,
+        height: 144,
+        frames: 10,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-qp", "4", "-x264-params", "bframes=2:chroma-qp-offset=-6"],
+        motion: ZOOM_PAN,
+    },
+    HbdFixture {
+        name: "hbd_422p10_inter_qp_high",
+        width: 176,
+        height: 144,
+        frames: 10,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-qp", "56", "-x264-params", "bframes=2:chroma-qp-offset=6"],
+        motion: ZOOM_PAN,
+    },
+    // XAVC S-like structure: 24-picture GOP, two B-pictures, eight slices per picture
+    HbdFixture {
+        name: "hbd_422p10_inter_xavcs",
+        width: 352,
+        height: 288,
+        frames: 30,
+        pix_fmt: "yuv422p10le",
+        args: &["-profile:v", "high422", "-x264-params", "keyint=24:bframes=2:slices=8"],
+        motion: ZOOM_PAN,
     },
 ];
 
@@ -108,7 +208,8 @@ fn ensure(f: &HbdFixture) -> Option<(PathBuf, PathBuf)> {
     let yuv = dir.join(format!("{}.yuv", f.name));
     if !h264.exists() {
         let tmp = filmcraft_testkit::temp_path(&h264);
-        let vf = format!("testsrc2=size={}x{}:rate=25,format={},noise=alls=10:allf=t+u", f.width, f.height, f.pix_fmt);
+        let motion = if f.motion.is_empty() { String::new() } else { format!("{}:s={}x{},", f.motion, f.width, f.height) };
+        let vf = format!("testsrc2=size={}x{}:rate=25,{motion}format={},noise=alls=10:allf=t+u", f.width, f.height, f.pix_fmt);
         let ok = Command::new(&ff)
             .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", &vf, "-frames:v", &f.frames.to_string(), "-c:v", "libx264"])
             .args(["-pix_fmt", f.pix_fmt])
@@ -197,35 +298,13 @@ hbd_tests!(
     hbd_422p8_intra_cavlc,
     hbd_420p10_inter,
     hbd_420p10_inter_cavlc,
+    hbd_422p10_inter,
+    hbd_422p10_inter_cavlc,
+    hbd_422p8_inter,
+    hbd_422p10_inter_motion,
+    hbd_422p10_inter_temporal_direct,
+    hbd_422p10_inter_no8x8_cqm,
+    hbd_422p10_inter_qp_low,
+    hbd_422p10_inter_qp_high,
+    hbd_422p10_inter_xavcs,
 );
-
-/// 4:2:2 with inter prediction (High 4:2:2 long-GOP) is reported as unsupported, not decoded
-/// into wrong pictures and not a crash.
-#[test]
-fn hbd_422_inter_is_unsupported() {
-    let Some(ff) = filmcraft_testkit::ffmpeg_or_skip("hbd_422_inter") else { return };
-    let path = common::fixtures_dir().join("hbd_422_inter.h264");
-    if !path.exists() {
-        let tmp = filmcraft_testkit::temp_path(&path);
-        let ok = Command::new(&ff)
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=176x144:rate=25", "-frames:v", "8"])
-            .args(["-c:v", "libx264", "-pix_fmt", "yuv422p10le", "-profile:v", "high422", "-f", "h264"])
-            .arg(&tmp)
-            .status()
-            .is_ok_and(|s| s.success());
-        assert!(ok);
-        std::fs::rename(&tmp, &path).unwrap();
-    }
-    let data = std::fs::read(path).unwrap();
-    let mut dec = Decoder::with_threads(1);
-    let mut err = None;
-    for au in common::split_access_units(&data) {
-        if let Err(e) = dec.decode(au, 0) {
-            err = Some(e);
-            break;
-        }
-    }
-    dec.flush();
-    let err = err.or_else(|| dec.take_error());
-    assert!(err.is_some_and(|e| e.to_string().contains("4:2:2")), "4:2:2 inter slices must be refused");
-}

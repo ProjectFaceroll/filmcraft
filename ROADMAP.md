@@ -7,7 +7,7 @@
 
 **Stage: alpha** · next: beta, ~19 points of ready-for-real-work and ~400–700 h away, plus opening Premiere's `.prproj` ([why](docs/target-app-parity.md#stage); passes the [core-workflow gate](docs/roadmap.md#alpha-gate))
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-08 · **Change:** minor (H.264 High 10 and High 4:2:2 Intra in software; G3 narrowed to 4:2:2 inter and HEVC 4:2:2) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-08 · **Change:** minor (H.264 High 4:2:2 long-GOP in software; G3 narrowed to HEVC 4:2:2) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 > **Naming update (2026-11-08):** First-party feature labels now follow the selected ArtCraft naming scheme in [PR #1880](https://github.com/storytold/filmcraft/pull/1880). Capabilities, estimates and parity scores were not re-measured.
 
@@ -105,7 +105,7 @@ Ranked; detail and "done when" in [docs/roadmap.md](docs/roadmap.md) and [docs/g
 
 1. **No launch crashes, and CI on pull requests** (macOS 12, Intel UHD, Windows 11 reports; no workflow runs the tests today). 40–80 h.
 2. **Open Premiere's `.prproj`**, the beta blocker. 60–120 h.
-3. **10-bit / 4:2:2 camera media without hardware** (H.264 4:2:2 inter, HEVC 4:2:2; #626; H.264 High 10 and High 4:2:2 Intra done). 20–35 h.
+3. **10-bit / 4:2:2 camera media without hardware** (HEVC 4:2:2; #626; H.264 High 10 and High 4:2:2 intra and long-GOP done). 15–25 h.
 4. **Measure fidelity against Premiere** and add `cargo xtask parity`. 50–90 h.
 5. **Real-world media corpus and workflow acceptance tests.** 40–70 h.
 6. **Hardware acceleration, continued** (#30): zero-copy upload, more effects on the GPU, Quick Sync / AMD encoders, VideoToolbox Main 10. 120–200 h.
@@ -176,6 +176,7 @@ Ranked; detail and "done when" in [docs/roadmap.md](docs/roadmap.md) and [docs/g
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-07 | minor | H.264 High 4:2:2 long-GOP decode in software (XAVC S / XAVC L 4:2:2); Current focus item 3 narrowed to HEVC 4:2:2 |
 | 2026-11-05 | minor | H.264 High 10 and High 4:2:2 Intra decode in software (XAVC Intra, AVC-Intra); Current focus item 3 narrowed to H.264 4:2:2 inter and HEVC 4:2:2 |
 | 2026-10-22 | minor | ProRes alpha: write the final singleton run code; 4444/XQ HD clips that failed native macOS decoding now decode, with syntax regression tests (EffectCraft #293) |
 | 2026-10-19 | minor | Language table: Czech (#1156, 100%) |
