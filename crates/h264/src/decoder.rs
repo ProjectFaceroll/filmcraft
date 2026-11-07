@@ -411,9 +411,6 @@ impl Decoder {
         if matches!(sh.slice_type, SliceType::Sp | SliceType::Si) {
             return unsupported("SP/SI slices");
         }
-        if sps.chroma_array_type() == 2 && !sh.slice_type.is_intra() {
-            return unsupported("inter prediction in 4:2:2 streams (only intra pictures are implemented)");
-        }
         if sh.redundant_pic_cnt > 0 {
             return Ok(()); // redundant slices are ignored
         }

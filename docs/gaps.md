@@ -65,20 +65,18 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 ## G3. 10-bit and 4:2:2 camera media needs hardware
 
-- **Have:** H.264 High 10 (9/10-bit 4:2:0, intra and inter) and High 4:2:2 Intra (4:2:2 8–10-bit
-  intra pictures: Sony XAVC Intra, AVC-Intra) in software, bit-exact with ffmpeg.
-- **Missing:** H.264 4:2:2 inter prediction (long-GOP 4:2:2: XAVC S / XAVC L 4:2:2, most
-  mirrorless 4:2:2 MOVs), 4:4:4, lossless, interlaced field / MBAFF (`crates/h264/README.md`);
-  HEVC has no 4:2:2 / RExt. Most mirrorless and cinema cameras record long-GOP 4:2:2 (Sony
-  XAVC S / XAVC HS 4:2:2 10-bit, Panasonic long-GOP, Canon XF-AVC long-GOP, Fujifilm).
+- **Have:** H.264 High 10 (9/10-bit 4:2:0, intra and inter) and High 4:2:2 at 8–10 bits, intra and
+  long-GOP (Sony XAVC Intra, XAVC S / XAVC L 4:2:2, AVC-Intra, Panasonic and Canon XF-AVC
+  long-GOP) in software, bit-exact with ffmpeg.
+- **Missing:** HEVC has no 4:2:2 / RExt (Sony XAVC HS 4:2:2, Fujifilm, Panasonic HEVC 4:2:2);
+  H.264 4:4:4, lossless and interlaced field / MBAFF (`crates/h264/README.md`).
 - **Evidence:** #626 (Panasonic Lumix 4K 10-bit 4:2:2 MOV). On macOS VideoToolbox decodes 10-bit
   4:2:2 H.264 / HEVC on chips that support it; Windows Media Foundation and Linux decline them, and
   there is no software fallback, so the clip fails. Premiere decodes them everywhere (and in
   hardware on Apple silicon, Intel and NVIDIA Blackwell).
-- **Impact:** long-GOP 4:2:2 camera originals (H.264 and HEVC) do not open on Windows or Linux;
-  intra-only 4:2:2 (XAVC Intra, AVC-Intra) and High 10 do.
-- **Estimate:** H.264 4:2:2 inter (chroma motion compensation, inter chroma deblocking) 5–10 h;
-  HEVC Main 4:2:2 10 (RExt subset) 15–25 h. Doc: [codec-parity.md](codec-parity.md).
+- **Impact:** HEVC 4:2:2 camera originals do not open on Windows or Linux; H.264 4:2:2 (intra and
+  long-GOP) and High 10 do.
+- **Estimate:** HEVC Main 4:2:2 10 (RExt subset) 15–25 h. Doc: [codec-parity.md](codec-parity.md).
 
 ## G4. Crashes at start-up, and no test CI on pull requests
 
@@ -358,3 +356,4 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 | 2026-10-24 | minor | G8: dragging the cut on a transition's timeline in Effect Controls moves the cut, and the transition moves with it (#577) |
 | 2026-10-26 | minor | G13: optional GIF binary transparency, threshold and frame-disposal regression coverage (#3396); estimates unchanged |
 | 2026-11-05 | minor | G3: H.264 High 10 and High 4:2:2 Intra decode in software (XAVC Intra, AVC-Intra); 4:2:2 inter remains unsupported |
+| 2026-11-07 | minor | G3: H.264 4:2:2 inter (long-GOP High 4:2:2: XAVC S / XAVC L 4:2:2) decodes in software; HEVC 4:2:2 remains; estimate 15–25 h |
