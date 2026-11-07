@@ -161,6 +161,8 @@ pub struct Playback {
     /// s; negative = not yet stamped), and whether the Program monitor has them ready.
     pub preroll: Option<f64>,
     pub preroll_ready: bool,
+    /// ... or still being made (the preroll waits longer, [`frames::PREROLL_MAX_S`]).
+    pub preroll_pending: bool,
     /// The window was hidden (occluded/minimized) since the monitor last refreshed.
     pub hidden: bool,
     /// Forward playback stops here (Play In to Out, Play from Playhead to Out Point).

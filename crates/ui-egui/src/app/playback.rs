@@ -42,6 +42,7 @@ impl FilmcraftApp {
         self.playback.smooth_playhead = None;
         self.playback.preroll = Some(-1.0);
         self.playback.preroll_ready = false;
+        self.playback.preroll_pending = false;
         if let Some(a) = self.audio.as_mut() {
             a.stop();
         }
@@ -224,7 +225,8 @@ impl FilmcraftApp {
         if let Some(since) = self.playback.preroll {
             let since = if since < 0.0 { now } else { since };
             self.playback.preroll = Some(since);
-            if self.playback.preroll_ready || now - since >= frames::PREROLL_TIMEOUT_S {
+            let timeout = if self.playback.preroll_pending { frames::PREROLL_MAX_S } else { frames::PREROLL_TIMEOUT_S };
+            if self.playback.preroll_ready || now - since >= timeout {
                 self.end_preroll(now);
             } else {
                 ctx.request_repaint();
