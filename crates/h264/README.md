@@ -21,20 +21,24 @@ oracles and fixture generators.
   decoded reference picture marking. POC types 0, 1, 2. `frame_num` gap handling ("non-existing"
   frames).
 - Entropy coding: CAVLC and CABAC (all syntax elements needed for frame coding, 4:2:0 and 4:2:2).
-- Sample formats: 8-bit 4:2:0; 9- and 10-bit 4:2:0 (High 10, intra and inter); 4:2:2 at 8–10 bits
-  for intra pictures (High 4:2:2 Intra: Sony XAVC Intra, AVC-Intra). The decoder is generic over the
+- Sample formats: 8-bit 4:2:0; 9- and 10-bit 4:2:0 (High 10); 4:2:2 at 8–10 bits, intra and inter
+  (High 4:2:2 Intra: Sony XAVC Intra, AVC-Intra; High 4:2:2 long-GOP: Sony XAVC S / XAVC L 4:2:2,
+  Panasonic, Canon XF-AVC long-GOP). The decoder is generic over the
   sample storage (`u8` for 8-bit, `u16` above); high bit depth pictures come out in `Picture::wide`.
 - Macroblocks: I (Intra 4x4 / 8x8 / 16x16, I_PCM), P (all partitions, P_8x8ref0, P_Skip),
   B (all partitions and sub-partitions, B_Skip, B_Direct_16x16, B_Direct_8x8), spatial and temporal
   direct prediction with/without `direct_8x8_inference`, constrained intra prediction.
 - Transforms / quantisation: 4x4, 8x8, Intra16x16 DC Hadamard, 2x2 chroma DC (4:2:0) and 2x4
   chroma DC (4:2:2); flat and custom scaling matrices (SPS and PPS level).
-- Inter prediction: quarter-sample 6-tap luma, eighth-sample chroma, explicit and implicit weighted
+- Inter prediction: quarter-sample 6-tap luma, eighth-sample chroma (in 4:2:2 the chroma has the
+  full luma height, so vertical chroma vectors are quarter samples: `yIntC = yAL + (mvCLX[1] >> 2)`,
+  `yFracC = (mvCLX[1] & 3) << 1`, 8.4.1.4 and 8.4.2.2.2), explicit and implicit weighted
   prediction, multiple reference frames, long-term references.
 - DPB: sliding window, all MMCOs (1-6), IDR / `no_output_of_prior_pics`, bumping with DPB size from
   the level (or VUI `max_dec_frame_buffering`) and `max_num_reorder_frames`.
 - Deblocking filter: full bS derivation, `disable_deblocking_filter_idc` 0/1/2, slice offsets,
-  8x8-transform edges.
+  8x8-transform edges; 4:2:2 horizontal chroma edges every four lines, using the bS of luma edges 1
+  and 3 also under the 8x8 transform (8.7.2.1).
 - Output: cropped planar 4:2:0 or 4:2:2 pictures (8-bit in `y`/`u`/`v`, higher bit depths in
   `wide`) in output order with the caller's `pts`, POC, key flag, VUI colour description (range,
   primaries, transfer, matrix) and sample aspect ratio.
@@ -123,11 +127,14 @@ with ffmpeg + libx264; tests print a message and skip when `/opt/homebrew/bin/ff
 - Vectorised kernels against their straightforward forms on random input: the deblocking edge
   filter against the per-line filter, the 4x4 / 8x8 inverse transforms against the per-column
   formulation.
-- High bit depth / 4:2:2 (`tests/it/high_bit_depth.rs`): nine libx264 fixtures (High 4:2:2 Intra
-  at 8 and 10 bits, CABAC and CAVLC, several slices, extreme QPs, `cqm=jvt`; High 10 with B-frames,
-  weighted prediction and CAVLC) compared byte-for-byte with ffmpeg's `yuv422p`/`yuv422p10le`/
-  `yuv420p10le` output, with 1 and 4 threads; a 4:2:2 inter stream must return
-  `Error::Unsupported`.
+- High bit depth / 4:2:2 (`tests/it/high_bit_depth.rs`): eighteen libx264 fixtures compared
+  byte-for-byte with ffmpeg's `yuv422p`/`yuv422p10le`/`yuv420p10le` output, with 1 and 4 threads:
+  High 4:2:2 Intra at 8 and 10 bits (CABAC and CAVLC, several slices, extreme QPs, `cqm=jvt`);
+  High 10 with B-frames, weighted prediction and CAVLC; High 4:2:2 long-GOP at 8 and 10 bits (CABAC
+  and CAVLC, B-pyramid, temporal direct, explicit P and B weights, `cqm=jvt` without the 8x8
+  transform, QP 4 and 56 with chroma QP offsets, an XAVC S-like 24-picture GOP with eight slices).
+  The long-GOP fixtures with `motion` run the test source through a slow zoom and pan, so most
+  blocks have fractional vectors and some point outside the picture.
 
 ### Fixture matrix (all bit-exact, single- and multi-threaded)
 
@@ -213,20 +220,10 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 - Interlaced coding (field pictures, PAFF, MBAFF): streams with `frame_mbs_only_flag = 0` return
   `Error::Unsupported`.
-- Inter prediction in 4:2:2 streams (long-GOP High 4:2:2), 4:4:4, monochrome, bit depths above 10,
-  unequal luma / chroma bit depths and lossless (`qpprime_y_zero_transform_bypass`) return
+- 4:4:4, monochrome, bit depths above 10, unequal luma / chroma bit depths and lossless (`qpprime_y_zero_transform_bypass`) return
   `Error::Unsupported`.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.
 - Error concealment is minimal: undecodable slices leave the prediction/previous content; missing
   references are replaced by other references.
 - No SIMD intrinsics (the hot loops are written to auto-vectorise); CABAC residual decoding is
   inherently serial and now dominates.
-
-### Extending to 4:2:2 inter prediction
-
-High 10 and 4:2:2 intra are in place (generic `Sample`, `Format` with bit depth and chroma lines per
-macroblock). For 4:2:2 P/B pictures the remaining pieces are the chroma motion compensation
-(vertical chroma vectors in full-resolution units: `yIntC = yAL + (mvCLX[1] >> 2)`,
-`yFracC = (mvCLX[1] & 3) << 1`, 8.4.2.2.2), 4:2:2 chroma blocks in `mc_rect` / the weighted
-prediction scratch, and inter bS for the horizontal chroma edges 4 and 12 with the 8x8 transform;
-then drop the check in `Decoder::handle_slice`.

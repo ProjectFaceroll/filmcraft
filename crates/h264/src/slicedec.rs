@@ -209,7 +209,7 @@ pub(crate) struct Scratch<S> {
     /// Subset of `c_nz` with a non-zero AC coefficient.
     pub c_ac: [u8; 2],
     pub pred: [[S; 256]; 2],
-    pub pred_c: [[[S; 64]; 2]; 2],
+    pub pred_c: [[[S; 128]; 2]; 2],
 }
 
 impl<S: Sample> Scratch<S> {
@@ -223,7 +223,7 @@ impl<S: Sample> Scratch<S> {
             c_nz: [0; 2],
             c_ac: [0; 2],
             pred: [[S::default(); 256]; 2],
-            pred_c: [[[S::default(); 64]; 2]; 2],
+            pred_c: [[[S::default(); 128]; 2]; 2],
         })
     }
 }
@@ -270,7 +270,9 @@ pub struct SliceDecoder<'a, S> {
 }
 
 /// Interpolate a bw x bh luma block at (px, py) with motion vector `mv` from reference `f` into `y`,
-/// and the corresponding chroma blocks into `c` (stride `cs`).
+/// and the corresponding chroma blocks into `c` (stride `cs`). `hc` is the number of chroma lines per
+/// macroblock: 8 for 4:2:0, 16 for 4:2:2, where chroma has the full luma height and vertical chroma
+/// vectors are in quarter samples (8.4.1.4, 8.4.2.2.2).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn predict_block<S: Sample>(
@@ -282,6 +284,7 @@ fn predict_block<S: Sample>(
     c: [&mut [S]; 2],
     cs: usize,
     max: i32,
+    hc: usize,
 ) {
     const LW: usize = 24;
     let mut win = [S::default(); LW * 21];
@@ -290,11 +293,16 @@ fn predict_block<S: Sample>(
     f.luma_window((ix - 2, iy - 2), bw + 5, bh + 5, &mut win, LW);
     inter::mc_luma_win(&win, LW, McBlock { fx: (mv[0] & 3) as u32, fy: (mv[1] & 3) as u32, bw, bh }, y.0, y.1, max);
     let cx = (px / 2) as i32 + (mv[0] as i32 >> 3);
-    let cy = (py / 2) as i32 + (mv[1] as i32 >> 3);
-    let (cw, ch) = (bw / 2, bh / 2);
-    let (fx, fy) = ((mv[0] & 7) as u32, (mv[1] & 7) as u32);
+    let fx = (mv[0] & 7) as u32;
+    // 4:2:2: yIntC = yAL / SubHeightC + (mvCLX[1] >> 2), yFracC = (mvCLX[1] & 3) << 1 (8.4.1.4, 8.4.2.2.2)
+    let (cy, ch, fy) = if hc == 16 {
+        (py as i32 + (mv[1] as i32 >> 2), bh, ((mv[1] & 3) as u32) << 1)
+    } else {
+        ((py / 2) as i32 + (mv[1] as i32 >> 3), bh / 2, (mv[1] & 7) as u32)
+    };
+    let cw = bw / 2;
     for (comp, out) in c.into_iter().enumerate() {
-        let mut w = [S::default(); 16 * 9];
+        let mut w = [S::default(); 16 * 17];
         f.chroma_window(comp, (cx, cy), cw + 1, ch + 1, &mut w, 16);
         inter::mc_chroma_win(&w, 16, McBlock { fx, fy, bw: cw, bh: ch }, out, cs);
     }
@@ -307,11 +315,9 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
 }
 
 impl<'a, S: Sample> SliceDecoder<'a, S> {
-    /// Set up a slice of `pic`; P and B slices in 4:2:2 pictures are rejected (no 4:2:2 inter
-    /// prediction yet).
+    /// Set up a slice of `pic`.
     pub fn new(sh: &'a SliceHeader, pps: &'a Pps, sps: &'a Sps, pic: &'a mut PicState<S>, refs: &'a [Vec<RefPic>; 2], ls: &'a LevelScale) -> Result<Self> {
         let fmt = pic.planes.fmt;
-        ensure!(fmt.mb_hc == 8 || sh.slice_type.is_intra(), "inter prediction in 4:2:2 streams is not implemented");
         let slice_num = pic.slices.len() as u32;
         let chroma_qp_offset = [pps.chroma_qp_index_offset, pps.second_chroma_qp_index_offset];
         pic.slices.push(SliceInfo {
@@ -816,7 +822,8 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let use1 = refs[1] >= 0 && self.refs[1].get(refs[1] as usize).is_some();
         let ys = self.pic.planes.width;
         let cs = self.pic.planes.cwidth;
-        let (cx, cy) = (px / 2, py / 2);
+        let hc = self.fmt.mb_hc;
+        let (cx, cy) = (px / 2, py * hc / 16);
         let max = self.fmt.max();
         if use0 != use1 && wts.iter().all(|w| *w == Weight::Default) {
             // single-list unweighted prediction: interpolate straight into the picture
@@ -832,6 +839,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                 [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]],
                 cs,
                 max,
+                hc,
             );
             return;
         }
@@ -842,7 +850,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             }
             let Some(rp) = self.refs[l].get(refs[l] as usize) else { continue };
             let [pc0, pc1] = &mut s.pred_c[l];
-            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8, max);
+            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8, max, hc);
         }
         inter::weighted_store(
             &mut self.pic.planes.y[py * ys + px..],
@@ -859,7 +867,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             let a = if use0 { Some(&s.pred_c[0][c][..]) } else { None };
             let b = if use1 { Some(&s.pred_c[1][c][..]) } else { None };
             let plane = if c == 0 { &mut self.pic.planes.cb } else { &mut self.pic.planes.cr };
-            inter::weighted_store(&mut plane[cy * cs + cx..], cs, a, b, 8, (bw / 2, bh / 2), wc, max);
+            inter::weighted_store(&mut plane[cy * cs + cx..], cs, a, b, 8, (bw / 2, bh * hc / 16), wc, max);
         }
     }
 
