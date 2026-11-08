@@ -464,10 +464,11 @@ fn recycle_h264_planes() {
 
 /// A frame-threaded H.264 decoder outputs a picture only `threads + 2` samples after it was
 /// fed: at 16 threads that is 18 pictures, 360 ms at 50 fps, more than playback prefetches
-/// ahead (14 frames), so every frame came too late. 8 threads decoded 4K 4:2:2 10-bit long-GOP
-/// as fast as 16 on an 8-core / 16-thread CPU (the extra threads share cores) at half the
-/// latency.
-const MAX_H264_THREADS: usize = 8;
+/// ahead (14 frames), so every frame came too late. On an 8-core / 16-thread CPU, 4K 4:2:2
+/// 10-bit long-GOP playback showed the most frames with 10 threads: a picture job that waits
+/// for reference rows leaves its core idle, so a few more jobs than cores keep them busy,
+/// while 12 or 16 threads only contend with the frame workers and the UI.
+const MAX_H264_THREADS: usize = 10;
 
 /// Worker threads each H.264 decoder uses (frame threading; 1 on wasm), see [`MAX_H264_THREADS`].
 pub fn h264_threads() -> usize {
