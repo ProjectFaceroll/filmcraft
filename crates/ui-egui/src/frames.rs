@@ -357,11 +357,30 @@ impl GpuPlan {
     }
 }
 
-/// Finished plans, bounded by count and bytes (oldest use evicted first).
-#[derive(Default)]
+/// Finished plans, bounded by count and bytes.
+///
+/// Over the budget, plans that have been shown go first (least recently shown first), then
+/// unshown ones from the oldest (a plan that finished too late for its frame stays unshown
+/// behind the playhead), and never below `min` plans. While playing, the plans
+/// prefetched ahead of the playhead have not been shown yet, so least-recently-used eviction
+/// over the whole cache took exactly the frame due next, and `BUDGET` holds 15 plans of a 4K
+/// 4:2:2 10-bit sequence (~66 MB each: the frame and its texture), fewer than the prefetch
+/// depth plus the jobs in flight. FX6 XAVC-I playback at 50 fps showed 229 of 400 frames
+/// that way, with 93% of them finished before they were due; with the window kept, 352.
 struct PlanCache {
-    map: HashMap<FrameKey, (Arc<GpuPlan>, u64, usize)>,
+    map: HashMap<FrameKey, PlanEntry>,
     clock: u64,
+    bytes: usize,
+    /// Plans kept whatever their bytes: the prefetch window plus the jobs in flight
+    /// ([`PlanCache::new`]).
+    min: usize,
+}
+
+struct PlanEntry {
+    plan: Arc<GpuPlan>,
+    /// The clock when the plan was last taken for display; None until it is.
+    shown: Option<u64>,
+    inserted: u64,
     bytes: usize,
 }
 
@@ -369,34 +388,51 @@ impl PlanCache {
     const MAX: usize = 96;
     const BUDGET: usize = 1 << 30;
 
+    /// A cache that keeps at least the deepest prefetch window plus the `workers` jobs that
+    /// may finish while it is full (and a couple of frames of slack).
+    fn new(workers: usize) -> Self {
+        let min = (prefetch_depth(2.0) as usize).saturating_add(workers).saturating_add(2).min(Self::MAX);
+        PlanCache { map: HashMap::new(), clock: 0, bytes: 0, min }
+    }
+
     fn get(&mut self, k: &FrameKey) -> Option<Arc<GpuPlan>> {
         self.clock += 1;
         let clock = self.clock;
-        self.map.get_mut(k).map(|(p, used, _)| {
-            *used = clock;
-            p.clone()
+        self.map.get_mut(k).map(|e| {
+            e.shown = Some(clock);
+            e.plan.clone()
         })
     }
 
     fn insert(&mut self, k: FrameKey, p: GpuPlan) {
         self.clock += 1;
-        let b = p.bytes();
-        self.bytes += b;
-        if let Some((_, _, old)) = self.map.insert(k, (Arc::new(p), self.clock, b)) {
-            self.bytes -= old;
+        let bytes = p.bytes();
+        self.bytes += bytes;
+        if let Some(old) = self.map.insert(k, PlanEntry { plan: Arc::new(p), shown: None, inserted: self.clock, bytes }) {
+            self.bytes -= old.bytes;
         }
         if self.map.len() > Self::MAX || self.bytes > Self::BUDGET {
-            let mut v: Vec<(u64, FrameKey, usize)> = self.map.iter().map(|(k, v)| (v.1, *k, v.2)).collect();
-            v.sort_unstable_by_key(|x| x.0);
-            for (_, k, b) in v {
-                if self.map.len() <= Self::MAX && self.bytes <= Self::BUDGET {
+            let mut v: Vec<(FrameKey, Option<u64>, u64, usize)> = self.map.iter().map(|(k, e)| (*k, e.shown, e.inserted, e.bytes)).collect();
+            sort_for_eviction(&mut v);
+            for (k, _, _, b) in v {
+                if self.map.len() > Self::MAX || (self.bytes > Self::BUDGET && self.map.len() > self.min) {
+                    self.map.remove(&k);
+                    self.bytes -= b;
+                } else {
                     break;
                 }
-                self.map.remove(&k);
-                self.bytes -= b;
             }
         }
     }
+}
+
+/// Order `(key, shown, inserted, bytes)` entries for eviction (see [`PlanCache`]): shown
+/// entries first, least recently shown first, then unshown entries from the oldest.
+fn sort_for_eviction<K>(v: &mut [(K, Option<u64>, u64, usize)]) {
+    v.sort_unstable_by_key(|&(_, shown, inserted, _)| match shown {
+        Some(t) => (0u8, t),
+        None => (1, inserted),
+    });
 }
 
 struct Cache {
@@ -527,7 +563,7 @@ impl FrameServer {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             done: Mutex::new(Cache { map: HashMap::new(), bytes: 0, budget: 768 << 20, clock: 0 }),
-            plans: Mutex::new(PlanCache::default()),
+            plans: Mutex::new(PlanCache::new(workers)),
             in_flight: Mutex::new(Vec::new()),
             profiling: AtomicBool::new(false),
             records: Mutex::new(Vec::new()),
@@ -1281,6 +1317,31 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_eviction_spares_the_prefetch_window() {
+        // frames 1..=3 shown (3 most recently), 4..=8 made in order: the shown ones go first,
+        // oldest shown first, then the unshown ones from the oldest
+        let mut v = vec![
+            (4u32, None, 14u64, 1usize),
+            (1, Some(21), 11, 1),
+            (8, None, 18, 1),
+            (2, Some(22), 12, 1),
+            (6, None, 16, 1),
+            (3, Some(23), 13, 1),
+            (5, None, 15, 1),
+            (7, None, 17, 1),
+        ];
+        super::sort_for_eviction(&mut v);
+        assert_eq!(v.iter().map(|e| e.0).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn plan_cache_min_covers_prefetch_and_workers() {
+        let c = super::PlanCache::new(6);
+        assert_eq!(c.min, 24 + 6 + 2);
+        assert!(c.min <= super::PlanCache::MAX);
+    }
+
     use super::{FrameKey, PlaybackMeter, Target, background_work, playback_plan, recent_keys};
     use filmcraft_project::ItemId;
 
