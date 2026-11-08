@@ -1544,42 +1544,59 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     fn residual_cavlc(&mut self, r: &mut BitReader, cbp: u8) -> Result<()> {
         let kind = self.mb().kind;
         let t8 = self.mb().transform_8x8;
+        let intra = kind.is_intra();
+        let t = cavlc::tables();
+        let mut cur = cavlc::Cursor::new(r)?;
+        let qp = self.qp_prime();
         if kind == MbKind::I16x16 {
             let nc = self.nc_luma(0);
             let mut lv = [0i32; 16];
-            cavlc::residual_block(r, &mut lv, 0, 15, 16, nc)?;
+            cavlc::residual_block(t, &mut cur, &mut lv[..], 0, 15, 16, nc)?;
             self.put_luma_dc(&lv);
         }
+        // the coefficients are dequantised as they are placed (`cavlc::Dequant`), straight into
+        // the raster-order scratch blocks
+        let ls4 = &self.ls.ls4[if intra { 0 } else { 3 }][(qp % 6) as usize];
+        let ls8 = &self.ls.ls8[if intra { 0 } else { 1 }][(qp % 6) as usize];
         for b8 in 0..4 {
             let (bx8, by8) = ((b8 & 1) * 2, (b8 >> 1) * 2);
             if cbp & (1 << b8) == 0 {
                 continue;
             }
             if t8 {
-                let mut lv8 = [0i32; 64];
+                let (mut nz, mut ac) = (false, false);
                 for i4 in 0..4 {
                     let raster = (by8 + (i4 >> 1)) * 4 + bx8 + (i4 & 1);
                     let nc = self.nc_luma(raster);
-                    let mut lv = [0i32; 16];
-                    let tc = cavlc::residual_block(r, &mut lv, 0, 15, 16, nc)?;
+                    let Some(out) = self.s.coef.get_mut(b8 * 64..b8 * 64 + 64) else { return invalid("8x8 block out of range") };
+                    let mut sink = cavlc::Dequant::<8> { out, scan: &ZIGZAG8, ls: ls8, qp, stride: 4, phase: i4, ac: false };
+                    let tc = cavlc::residual_block(t, &mut cur, &mut sink, 0, 15, 16, nc)?;
+                    ac |= sink.ac;
+                    nz |= tc > 0;
                     self.mb_mut().nnz[raster] = tc;
-                    for (i, &v) in lv.iter().enumerate() {
-                        lv8[4 * i + i4] = v;
-                    }
                 }
-                self.put_luma8(b8, &lv8);
+                if nz {
+                    self.s.blk_nz |= 1 << b8;
+                    self.s.blk_ac |= (ac as u16) << b8;
+                    let m = (0b11u16 << (by8 * 4 + bx8)) | (0b11u16 << ((by8 + 1) * 4 + bx8));
+                    self.pic.mbs[self.mb_addr].nz_mask |= m;
+                }
             } else {
+                let ac_only = kind == MbKind::I16x16;
                 for i4 in 0..4 {
                     let raster = (by8 + (i4 >> 1)) * 4 + bx8 + (i4 & 1);
                     let nc = self.nc_luma(raster);
-                    let mut lv = [0i32; 16];
-                    let tc = if kind == MbKind::I16x16 {
-                        cavlc::residual_block(r, &mut lv[1..], 0, 14, 15, nc)?
-                    } else {
-                        cavlc::residual_block(r, &mut lv, 0, 15, 16, nc)?
-                    };
+                    let Some(out) = self.s.coef.get_mut(raster * 16..raster * 16 + 16) else { return invalid("4x4 block out of range") };
+                    let phase = ac_only as usize;
+                    let mut sink = cavlc::Dequant::<4> { out, scan: &ZIGZAG4, ls: ls4, qp, stride: 1, phase, ac: false };
+                    let tc = cavlc::residual_block(t, &mut cur, &mut sink, 0, 15 - phase, 16 - phase, nc)?;
+                    let ac = sink.ac;
                     self.mb_mut().nnz[raster] = tc;
-                    self.put_luma4(raster, &lv, kind == MbKind::I16x16);
+                    if tc > 0 {
+                        self.s.blk_nz |= 1 << raster;
+                        self.s.blk_ac |= (ac as u16) << raster;
+                        self.pic.mbs[self.mb_addr].nz_mask |= 1 << raster;
+                    }
                 }
             }
         }
@@ -1589,25 +1606,31 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             for c in 0..2 {
                 let mut lv = [0i32; 8];
                 if nb == 8 {
-                    cavlc::residual_block(r, &mut lv, 0, 7, 8, -2)?;
+                    cavlc::residual_block(t, &mut cur, &mut lv[..], 0, 7, 8, -2)?;
                 } else {
-                    cavlc::residual_block(r, &mut lv, 0, 3, 4, -1)?;
+                    cavlc::residual_block(t, &mut cur, &mut lv[..], 0, 3, 4, -1)?;
                 }
                 self.put_chroma_dc(c, &lv);
             }
         }
         if cbp_c & 2 != 0 {
             for c in 0..2 {
+                let qpc = self.qpc_prime(c);
+                let ls = &self.ls.ls4[if intra { 1 + c } else { 4 + c }][(qpc % 6) as usize];
                 for b in 0..nb {
                     let nc = self.nc_chroma(c, b);
-                    let mut lv = [0i32; 16];
-                    let tc = cavlc::residual_block(r, &mut lv[1..], 0, 14, 15, nc)?;
+                    let Some(out) = self.s.coef_c.get_mut(c).and_then(|p| p.get_mut(b * 16..b * 16 + 16)) else { return invalid("chroma block out of range") };
+                    let mut sink = cavlc::Dequant::<4> { out, scan: &ZIGZAG4, ls, qp: qpc, stride: 1, phase: 1, ac: false };
+                    let tc = cavlc::residual_block(t, &mut cur, &mut sink, 0, 14, 15, nc)?;
                     self.mb_mut().nnz_c[c][b] = tc;
-                    self.put_chroma_ac(c, b, &lv);
+                    if tc > 0 {
+                        self.s.c_nz[c] |= 1 << b;
+                        self.s.c_ac[c] |= 1 << b;
+                    }
                 }
             }
         }
-        Ok(())
+        cur.commit(r)
     }
 
     /// Decode slice_data() with CAVLC. `r` is positioned after the slice header.

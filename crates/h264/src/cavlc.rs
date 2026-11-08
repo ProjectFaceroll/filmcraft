@@ -43,20 +43,21 @@ impl VlcTable {
     }
 }
 
-/// A bit cursor over the slice data for one residual block: [`BitReader`] without a bounds
-/// check per syntax element. Reads past the end of the data see zero bits, which no valid
-/// block ends in; [`Cursor::commit`] refuses a position past the data, so a truncated block
-/// fails there instead. A block reads at most about 1100 bits (coeff_token 16, trailing ones 3,
-/// 16 levels of a prefix of at most 26 bits and a suffix of at most 22, total_zeros 9 and 15
-/// run_before codes of 11), so the position cannot overflow.
-struct Cursor<'a> {
+/// A bit cursor over the slice data for the residual blocks of one macroblock: [`BitReader`]
+/// without a bounds check per syntax element. Reads past the end of the data see zero bits,
+/// which no valid block ends in; [`Cursor::commit`] refuses a position past the data, so a
+/// truncated macroblock fails there instead. A block reads at most about 1100 bits (coeff_token
+/// 16, trailing ones 3, 16 levels of a prefix of at most 26 bits and a suffix of at most 22,
+/// total_zeros 9 and 15 run_before codes of 11) and a macroblock has at most 48 of them, so
+/// the position cannot overflow.
+pub(crate) struct Cursor<'a> {
     data: &'a [u8],
     /// Position in bits.
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(r: &BitReader<'a>) -> Result<Self> {
+    pub(crate) fn new(r: &BitReader<'a>) -> Result<Self> {
         let data = r.data();
         let pos = r.position();
         ensure!(pos <= data.len() * 8, "unexpected end of bitstream");
@@ -107,14 +108,14 @@ impl<'a> Cursor<'a> {
 
     /// Move `r` to this position; fails when the block read past the end of the data.
     #[inline(always)]
-    fn commit(self, r: &mut BitReader<'a>) -> Result<()> {
+    pub(crate) fn commit(self, r: &mut BitReader<'a>) -> Result<()> {
         ensure!(self.pos <= self.data.len() * 8, "unexpected end of bitstream");
         r.seek_bits(self.pos);
         Ok(())
     }
 }
 
-struct Tables {
+pub(crate) struct Tables {
     /// coeff_token per nC class; value = (TrailingOnes << 5) | TotalCoeff
     coeff_token: [VlcTable; 6],
     total_zeros_4x4: [VlcTable; 15],
@@ -123,7 +124,7 @@ struct Tables {
     run_before: [VlcTable; 7],
 }
 
-fn tables() -> &'static Tables {
+pub(crate) fn tables() -> &'static Tables {
     static T: OnceLock<Tables> = OnceLock::new();
     T.get_or_init(|| {
         let coeff_token = std::array::from_fn(|col| {
@@ -149,11 +150,64 @@ pub(crate) fn init_tables() {
     let _ = tables();
 }
 
-/// Parse residual_block_cavlc(). Coefficients are written to `coeff[start_idx..=end_idx]` in scan order
-/// (entries outside the coded range are left untouched; the caller zeroes them).
-/// `nc` is the nC value (-1 for 4:2:0 chroma DC, -2 for 4:2:2 chroma DC). Returns TotalCoeff.
-pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: usize, end_idx: usize, max_num_coeff: usize, nc: i32) -> Result<u8> {
-    let t = tables();
+/// Where the coefficients of a residual block go, by scan position.
+pub(crate) trait Sink {
+    fn put(&mut self, scan: usize, level: i32);
+}
+
+/// Levels in scan order (blocks whose DC is dequantised separately).
+impl Sink for [i32] {
+    #[inline(always)]
+    fn put(&mut self, scan: usize, level: i32) {
+        if let Some(c) = self.get_mut(scan) {
+            *c = level;
+        }
+    }
+}
+
+/// Dequantised coefficients written straight into the raster-order `N` x `N` block `out`
+/// (8.5.12.1 / 8.5.13.1): the level at scan position `k` of the parsed block is coefficient
+/// `stride * k + phase` of the block's scan `scan` (1 / 0 for a 4x4 block, 1 / 1 for the AC of
+/// an Intra_16x16 or chroma block, 4 / `i4` for the four interleaved 4x4 parses of an 8x8
+/// block), scaled by `ls[pos]` for the block's QP. `ac` records a coefficient past the DC.
+pub(crate) struct Dequant<'a, const N: usize> {
+    pub out: &'a mut [i32],
+    pub scan: &'a [u8],
+    pub ls: &'a [i32],
+    pub qp: i32,
+    pub stride: usize,
+    pub phase: usize,
+    pub ac: bool,
+}
+
+impl<const N: usize> Sink for Dequant<'_, N> {
+    #[inline(always)]
+    fn put(&mut self, k: usize, level: i32) {
+        let idx = self.stride * k + self.phase;
+        let (Some(&p), true) = (self.scan.get(idx), idx < N * N) else { return };
+        let p = p as usize;
+        let Some(&ls) = self.ls.get(p) else { return };
+        let v = if N == 8 { crate::transform::scale8(level, ls, self.qp) } else { crate::transform::scale4(level, ls, self.qp) };
+        if let Some(o) = self.out.get_mut(p) {
+            *o = v;
+        }
+        self.ac |= idx > 0;
+    }
+}
+
+/// Parse residual_block_cavlc(). Coefficients at scan positions `start_idx..=end_idx` go to
+/// `sink` (positions it does not get stay as they are: the caller zeroes them). `nc` is the nC
+/// value (-1 for 4:2:0 chroma DC, -2 for 4:2:2 chroma DC). Returns TotalCoeff.
+#[inline]
+pub(crate) fn residual_block<K: Sink + ?Sized>(
+    t: &Tables,
+    c: &mut Cursor,
+    sink: &mut K,
+    start_idx: usize,
+    end_idx: usize,
+    max_num_coeff: usize,
+    nc: i32,
+) -> Result<u8> {
     let col = match nc {
         -1 => 4,
         -2 => 5,
@@ -162,12 +216,10 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
         4..=7 => 2,
         _ => 3,
     };
-    let mut c = Cursor::new(r)?;
     let tok = c.vlc(&t.coeff_token[col])?;
     let total_coeff = (tok & 31) as usize;
     let trailing_ones = (tok >> 5) as usize;
     if total_coeff == 0 {
-        c.commit(r)?;
         return Ok(0);
     }
     ensure!(total_coeff <= max_num_coeff, "TotalCoeff exceeds maxNumCoeff");
@@ -235,7 +287,7 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
     // runs and placement: highest-frequency coefficient first
     let mut pos = start_idx + total_coeff + zeros_left - 1;
     for (i, &lv) in level.iter().enumerate().take(total_coeff) {
-        coeff[pos] = lv;
+        sink.put(pos, lv);
         if i + 1 == total_coeff {
             break;
         }
@@ -249,7 +301,6 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
         };
         pos -= 1 + run;
     }
-    c.commit(r)?;
     Ok(total_coeff as u8)
 }
 
@@ -348,8 +399,11 @@ mod tests {
         let b = w.finish();
         let mut r = BitReader::new(&b);
         let mut c = [0i32; 16];
-        let tc = residual_block(&mut r, &mut c, 0, 15, 16, 0).unwrap();
+        let mut cur = Cursor::new(&r).unwrap();
+        let tc = residual_block(tables(), &mut cur, &mut c[..], 0, 15, 16, 0).unwrap();
+        cur.commit(&mut r).unwrap();
         assert_eq!(tc, 5);
         assert_eq!(&c[..10], &[0, 3, -1, 0, 0, -1, 1, 0, 1, 0]);
+        assert!(!r.more_rbsp_data());
     }
 }

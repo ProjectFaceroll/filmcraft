@@ -203,7 +203,181 @@ pub fn pred8x8<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize, mo
         }
         f.left[7] = (p.left[6] + 3 * p.left[7] + 2) >> 2;
     }
-    pred_nxn(mode, &f, 8, a, &mut plane[y * stride + x..], stride, fmt);
+    pred8x8_dir(mode, &f, a, &mut plane[y * stride + x..], stride, fmt);
+}
+
+/// Write one row of eight predicted samples.
+#[inline(always)]
+fn put_row8<S: Sample>(out: &mut [S], stride: usize, y: usize, vals: &[i32], max: i32) {
+    if let (Some(line), Some(v)) = (out.get_mut(y * stride..).and_then(|d| d.first_chunk_mut::<8>()), vals.first_chunk::<8>()) {
+        for (p, &v) in line.iter_mut().zip(v) {
+            *p = S::clip(v, max);
+        }
+    }
+}
+
+/// Intra_8x8 prediction (8.3.2.2.2-8.3.2.2.10) from the filtered neighbours `e`. Each
+/// directional mode is a few one-dimensional filters of the edge whose rows are slices of the
+/// result (or, for the modes that mix the two half-sample phases, a short per-sample choice
+/// between them), rather than the spec's formula per sample.
+fn pred8x8_dir<S: Sample>(mode: u8, e: &Edge, a: Avail, out: &mut [S], stride: usize, fmt: Format) {
+    let max = fmt.max();
+    let (t, l, tl) = (&e.top, &e.left, e.tl);
+    // the edge as one run: p[-1,7] .. p[-1,0], p[-1,-1], p[0,-1] .. p[7,-1]
+    let mut ed = [0i32; 17];
+    for (d, &v) in ed[..8].iter_mut().zip(l.iter().rev()) {
+        *d = v;
+    }
+    ed[8] = tl;
+    for (d, &v) in ed[9..].iter_mut().zip(t.iter()) {
+        *d = v;
+    }
+    match mode {
+        0 => {
+            for y in 0..8 {
+                put_row8(out, stride, y, &t[..8], max);
+            }
+        }
+        1 => {
+            for y in 0..8 {
+                put_row8(out, stride, y, &[l[y]; 8], max);
+            }
+        }
+        2 => {
+            let dc = [dc_nxn(e, 8, a, fmt.mid()); 8];
+            for y in 0..8 {
+                put_row8(out, stride, y, &dc, max);
+            }
+        }
+        3 => {
+            // diagonal down-left: pred[x, y] = d[x + y], the last sample from p[14,-1], p[15,-1]
+            let mut d = [0i32; 15];
+            for (k, dk) in d.iter_mut().enumerate().take(14) {
+                *dk = (t[k] + 2 * t[k + 1] + t[k + 2] + 2) >> 2;
+            }
+            d[14] = (t[14] + 3 * t[15] + 2) >> 2;
+            for y in 0..8 {
+                put_row8(out, stride, y, &d[y..], max);
+            }
+        }
+        4 => {
+            // diagonal down-right: pred[x, y] = f[8 + x - y]
+            let mut f = [0i32; 17];
+            for (i, fi) in f.iter_mut().enumerate().take(16).skip(1) {
+                *fi = tap3(&ed, i);
+            }
+            for y in 0..8 {
+                put_row8(out, stride, y, &f[8 - y..], max);
+            }
+        }
+        5 => pred8x8_vr::<S>(&ed, out, stride, max),
+        6 => pred8x8_hd::<S>(&ed, out, stride, max),
+        7 => {
+            // vertical-left: even rows are half-sample averages of the top, odd rows three taps
+            let mut h = [0i32; 12];
+            let mut d = [0i32; 12];
+            for (k, (hk, dk)) in h.iter_mut().zip(d.iter_mut()).enumerate() {
+                *hk = (t[k] + t[k + 1] + 1) >> 1;
+                *dk = (t[k] + 2 * t[k + 1] + t[k + 2] + 2) >> 2;
+            }
+            for y in 0..8 {
+                put_row8(out, stride, y, if y % 2 == 0 { &h[y / 2..] } else { &d[y / 2..] }, max);
+            }
+        }
+        _ => pred8x8_hu::<S>(l, out, stride, max),
+    }
+}
+
+/// The three-tap filter of `v` centred on `i`.
+#[inline(always)]
+fn tap3(v: &[i32], i: usize) -> i32 {
+    (v[i - 1] + 2 * v[i] + v[i + 1] + 2) >> 2
+}
+
+/// Vertical-right (8.3.2.2.7) from the edge run `ed` (see [`pred8x8_dir`]): half-sample
+/// averages of the top for even zVR, three taps for odd zVR, the left run's three taps below
+/// the diagonal.
+fn pred8x8_vr<S: Sample>(ed: &[i32; 17], out: &mut [S], stride: usize, max: i32) {
+    let mut f = [0i32; 17];
+    let mut h = [0i32; 17];
+    for (i, fi) in f.iter_mut().enumerate().take(16).skip(1) {
+        *fi = tap3(ed, i);
+    }
+    for (i, hi) in h.iter_mut().enumerate().skip(1) {
+        *hi = (ed[i - 1] + ed[i] + 1) >> 1;
+    }
+    let mut row = [0i32; 8];
+    for y in 0..8usize {
+        for (x, r) in row.iter_mut().enumerate() {
+            let z = 2 * x as i32 - y as i32;
+            *r = if z >= 0 && z % 2 == 0 {
+                h[9 + x - (y >> 1)]
+            } else if z > 0 {
+                f[8 + x - (y >> 1)]
+            } else if z == -1 {
+                f[8]
+            } else {
+                f[9 + 2 * x - y]
+            };
+        }
+        put_row8(out, stride, y, &row, max);
+    }
+}
+
+/// Horizontal-down (8.3.2.2.8): the mirror of [`pred8x8_vr`] along the left run.
+fn pred8x8_hd<S: Sample>(ed: &[i32; 17], out: &mut [S], stride: usize, max: i32) {
+    let mut f = [0i32; 17];
+    let mut h = [0i32; 17];
+    for (i, fi) in f.iter_mut().enumerate().take(16).skip(1) {
+        *fi = tap3(ed, i);
+    }
+    for (i, hi) in h.iter_mut().enumerate().take(16) {
+        *hi = (ed[i] + ed[i + 1] + 1) >> 1;
+    }
+    let mut row = [0i32; 8];
+    for y in 0..8usize {
+        for (x, r) in row.iter_mut().enumerate() {
+            let z = 2 * y as i32 - x as i32;
+            *r = if z >= 0 && z % 2 == 0 {
+                h[7 + (x >> 1) - y]
+            } else if z > 0 {
+                f[8 + (x >> 1) - y]
+            } else if z == -1 {
+                f[8]
+            } else {
+                f[7 + x - 2 * y]
+            };
+        }
+        put_row8(out, stride, y, &row, max);
+    }
+}
+
+/// Horizontal-up (8.3.2.2.10) along the left samples `l`, flattening to p[-1,7] past zHU 13.
+fn pred8x8_hu<S: Sample>(l: &[i32; 8], out: &mut [S], stride: usize, max: i32) {
+    let mut g = [0i32; 8];
+    let mut k3 = [0i32; 8];
+    for (i, gi) in g.iter_mut().enumerate().take(7) {
+        *gi = (l[i] + l[i + 1] + 1) >> 1;
+    }
+    for (i, ki) in k3.iter_mut().enumerate().take(6) {
+        *ki = (l[i] + 2 * l[i + 1] + l[i + 2] + 2) >> 2;
+    }
+    let z13 = (l[6] + 3 * l[7] + 2) >> 2;
+    let mut row = [0i32; 8];
+    for y in 0..8usize {
+        for (x, r) in row.iter_mut().enumerate() {
+            let z = x + 2 * y;
+            let i = y + (x >> 1);
+            *r = if z < 13 {
+                if z % 2 == 0 { g[i] } else { k3[i] }
+            } else if z == 13 {
+                z13
+            } else {
+                l[7]
+            };
+        }
+        put_row8(out, stride, y, &row, max);
+    }
 }
 
 /// Intra_16x16 prediction (8.3.3) for the macroblock at luma (x, y).
