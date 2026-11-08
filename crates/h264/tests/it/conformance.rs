@@ -29,6 +29,8 @@ fixture_tests!(
     cavlc_b_temporal,
     cavlc_weightp,
     slices4_cavlc,
+    intra_slices_nodeblock,
+    intra_slices_nodeblock_cabac,
     qp1_cavlc,
     main_cabac_b,
     high_720p,

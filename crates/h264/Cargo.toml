@@ -12,6 +12,8 @@ workspace = true
 [features]
 default = ["threads"]
 threads = ["dep:rayon"]
+# Stage timing printed by the `h264dec` example (development only).
+profile = []
 
 [dependencies]
 filmcraft-bitstream = { workspace = true }

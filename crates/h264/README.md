@@ -92,6 +92,26 @@ intrinsics: the edge filters process all 16 (luma) or 8 (chroma) lines of an edg
 per-lane masks, the inverse transforms do their column pass across all columns, and the CABAC
 engine decodes a context-coded bin without branching on its outcome.
 
+A picture whose slices are all intra, start at macroblock rows, cover the picture in order and
+do not deblock across their edges (`disable_deblocking_filter_idc` 1: XAVC Intra, AVC-Intra) is
+decoded as one job that splits into one band per slice (`band_plan`), run in parallel on the
+rayon pool the job runs on (the decoder's own, or with `with_threads(1)` the caller's). Each band
+reconstructs into buffers of its own rows, with the rows of other bands unavailable as another
+slice's macroblocks are, and writes its lines of the cropped output straight into the picture's
+output planes; no picture-sized copy follows. `Decoder::set_parallel_slices(false)` keeps the
+slices sequential (a benchmark baseline).
+
+Every job leaves the cropped output planes with the `Frame` (`Frame::set_output`), made on the
+worker from its reconstruction buffers, so `decode` only moves them into the `Picture`. The rows
+a `Frame` publishes for later pictures to predict from are copies in buffers recycled from
+finished frames (`RowPool`: fresh 33 MB allocations per 4K 4:2:2 10-bit picture cost more in
+page faults than the copies), and a picture of an intra profile (`Sps::is_intra_profile`), which
+no picture predicts from, publishes its rows without samples (`RowSamples::Absent`).
+
+The `profile` feature (development only) times the stages of a picture (parsing, intra
+reconstruction, inter prediction, inter residuals, deblocking, publishing) per thread; the
+`h264dec` example prints the breakdown.
+
 ### Draft mode
 
 `Decoder::set_draft(true)` (reduced-resolution playback only; FilmCraft enables it with Settings ▸
@@ -169,6 +189,8 @@ encoder is unavailable.
 | deblock_m2_2 | testsrc2+noise 352x288 | deblock=-2,2 |
 | cqm_jvt | testsrc2+noise 352x288 | cqm=jvt |
 | slices4 | testsrc2+noise 352x288 | slices=4 (CABAC) |
+| intra_slices_nodeblock | testsrc2+noise 350x282 | keyint=1, slices=4, no-deblock (CAVLC): parallel bands |
+| intra_slices_nodeblock_cabac | mandelbrot+noise 350x282 | keyint=1, slices=4, no-deblock (CABAC): parallel bands |
 | keyint10 | testsrc2+noise 352x288 | keyint=10 |
 | open_gop | testsrc2+noise 352x288 | open-gop, keyint=12, bframes=3 |
 | constrained_intra | testsrc2+noise 352x288 | constrained-intra |

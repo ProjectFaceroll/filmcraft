@@ -296,7 +296,8 @@ fn annexb_intra_profile(sample: &[u8]) -> bool {
 }
 
 /// Our pure-Rust H.264 decoder: frame-threaded, except for intra-profile streams, which it decodes
-/// one access unit at a time on the calling thread (see [`VideoDecoder::intra_only`]).
+/// one access unit at a time, its slices as parallel bands on the rayon pool the caller runs on
+/// (see [`VideoDecoder::intra_only`]).
 pub struct H264Decoder {
     avcc: Vec<u8>,
     dec: filmcraft_h264::Decoder,
@@ -307,7 +308,8 @@ pub struct H264Decoder {
     /// The stream's SPS declares an intra profile ([`sps_intra_profile`]): every access unit is
     /// decoded on its own, with the decoder reset before it, so frames can be decoded in any
     /// order and in parallel by separate instances. Frame threading would only add the latency
-    /// of the pictures in flight (a 4K picture per thread) to every frame.
+    /// of the pictures in flight (a 4K picture per thread) to every frame; the slices of one
+    /// picture decode in parallel instead, on the caller's rayon pool (the decode pool).
     intra: bool,
 }
 

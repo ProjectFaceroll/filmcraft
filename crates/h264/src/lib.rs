@@ -34,6 +34,7 @@ mod intra;
 mod mbtypes;
 pub mod params;
 mod picture;
+pub mod prof;
 pub use picture::{set_plane_allocator, set_plane_allocator_u16};
 pub mod slice;
 mod slicedec;

@@ -55,9 +55,9 @@ impl<S: Sample> SliceDecoder<'_, S> {
             self.start_mb(addr);
             let skip = !intra_slice && self.decode_skip_flag(&mut c);
             if skip {
-                self.decode_skip()?;
+                crate::prof::time(crate::prof::MB, || self.decode_skip())?;
             } else {
-                self.decode_mb_cabac(&mut c)?;
+                crate::prof::time(crate::prof::MB, || self.decode_mb_cabac(&mut c))?;
             }
             self.pic.mb_done(addr)?;
             ensure!(!c.overrun(), "CABAC read past end of slice data");
@@ -687,12 +687,12 @@ impl<S: Sample> SliceDecoder<'_, S> {
             self.prev_qp_delta_nz = false;
         }
         self.store_qp();
-        self.residual_cabac(c, cbp)?;
+        crate::prof::time(crate::prof::RESID, || self.residual_cabac(c, cbp))?;
         if intra {
-            self.reconstruct_intra();
+            crate::prof::time(crate::prof::INTRA, || self.reconstruct_intra());
         } else {
-            self.predict_inter();
-            self.reconstruct_inter_residual();
+            crate::prof::time(crate::prof::INTER_PRED, || self.predict_inter());
+            crate::prof::time(crate::prof::INTER_RESID, || self.reconstruct_inter_residual());
         }
         Ok(())
     }

@@ -9,7 +9,7 @@
 use crate::dpb::{Dpb, Output, OutputMeta, RefMark};
 use crate::error::{Error, Result, ensure, invalid, unsupported};
 use crate::params::{Pps, Sps};
-use crate::picture::{Format, Frame, FrameRef, MbKind, MbState, Planes, RefPic, Sample};
+use crate::picture::{Format, Frame, FrameRef, MbKind, MbState, OutputPlanes, Planes, RefPic, Sample};
 use crate::slice::{NalHeader, Poc, PocState, SliceHeader, SliceType, is_new_picture, nal_type};
 use crate::slicedec::{PicState, SliceDecoder};
 use crate::transform::LevelScale;
@@ -86,7 +86,13 @@ struct Shared {
     pool16: Mutex<Vec<PicState<u16>>>,
     /// Set by [`Decoder::reset`]: jobs still running stop at the next macroblock row.
     cancel: Arc<AtomicBool>,
+    /// Decode the slices of a picture one after the other even when they could run as bands
+    /// ([`Decoder::set_parallel_slices`]).
+    serial_slices: AtomicBool,
 }
+
+/// Recycled picture (and band) states kept per sample type.
+const STATE_POOL_MAX: usize = 16;
 
 /// The recycled picture buffers of one sample type.
 trait PoolSample: Sample {
@@ -217,6 +223,14 @@ impl Decoder {
         self.draft
     }
 
+    /// Whether the slices of an intra picture that do not deblock across their edges (AVC-Intra,
+    /// XAVC Intra: eight or more slices per picture) decode at the same time, as bands of
+    /// macroblock rows on the thread pool the decoder is called from (on by default). Off, a
+    /// picture is one job, which measures the per-core cost of a stream.
+    pub fn set_parallel_slices(&mut self, on: bool) {
+        self.shared.serial_slices.store(!on, Ordering::Relaxed);
+    }
+
     /// Forget the stream (parameter sets, `avcC` configuration, reference pictures and pending
     /// output) as if the decoder were new, e.g. to seek. Unlike making a new decoder, this keeps the
     /// worker threads, the draft setting and the recycled picture buffers, and the pictures still
@@ -303,7 +317,7 @@ impl Decoder {
         let max_queue = self.max_in_flight * 2;
         let mut pics = Vec::new();
         while let Some(o) = self.out_queue.front() {
-            if !o.frame.is_published(o.frame.mb_h() - 1) && self.out_queue.len() <= max_queue {
+            if !o.frame.output_ready() && self.out_queue.len() <= max_queue {
                 break;
             }
             let Some(o) = self.out_queue.pop_front() else { break };
@@ -539,7 +553,8 @@ impl Decoder {
         let Some(p) = self.pending.take() else { return Ok(()) };
         let PendingPic { frame, sps, first, poc, pts, key, slices } = p;
         let draft = self.draft && first.nal_ref_idc == 0;
-        self.dispatch(frame.clone(), slices, draft);
+        let (cx, cy, cw, ch) = sps.crop_rect();
+        self.dispatch(frame.clone(), slices, draft, (cx as usize, cy as usize, cw as usize, ch as usize));
         self.poc_state.update(&first, &poc);
         if first.nal_ref_idc != 0 {
             self.prev_ref_frame_num = if first.has_mmco5() { 0 } else { first.frame_num };
@@ -552,8 +567,9 @@ impl Decoder {
         Ok(())
     }
 
-    fn dispatch(&mut self, frame: FrameRef, slices: Vec<SliceJob>, draft: bool) {
+    fn dispatch(&mut self, frame: FrameRef, slices: Vec<SliceJob>, draft: bool, crop: (usize, usize, usize, usize)) {
         let shared = self.shared.clone();
+        frame.expect_output();
         #[cfg(feature = "threads")]
         if let Some(pool) = &self.pool {
             self.in_flight.retain(|f| !f.is_published(f.mb_h() - 1));
@@ -563,10 +579,10 @@ impl Decoder {
                 }
             }
             self.in_flight.push_back(frame.clone());
-            pool.spawn_fifo(move || run_job(frame, slices, &shared, draft));
+            pool.spawn_fifo(move || run_job(frame, slices, &shared, draft, crop));
             return;
         }
-        run_job(frame, slices, &shared, draft);
+        run_job(frame, slices, &shared, draft, crop);
     }
 
     /// Queue pictures that left the DPB in output order.
@@ -593,34 +609,87 @@ fn concealment_frame<S: Sample>(last: Option<&Frame>, id: u32, mb_w: usize, mb_h
 }
 
 /// Decode all slices of one picture and publish its rows.
-fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool) {
+fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool, crop: (usize, usize, usize, usize)) {
     if frame.fmt.wide() {
-        run_job_typed::<u16>(frame, slices, shared, draft);
+        run_job_typed::<u16>(frame, slices, shared, draft, crop);
     } else {
-        run_job_typed::<u8>(frame, slices, shared, draft);
+        run_job_typed::<u8>(frame, slices, shared, draft, crop);
     }
 }
 
-/// Decode, deblock and publish one picture with `S` samples, reusing a pooled buffer of the same
-/// size and format when there is one.
-fn run_job_typed<S: PoolSample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool) {
-    let reuse = S::pool(shared).lock().ok().and_then(|mut p| p.pop());
-    let mut pic: PicState<S> = match reuse {
-        Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.planes.fmt == frame.fmt => {
-            p.reset(frame.clone());
+/// The macroblock rows (`row0`, `rows`) each slice covers when the slices of a picture can decode
+/// as independent bands: all intra, none deblocking across slice edges, each starting a row
+/// and covering the picture in order.
+fn band_plan(slices: &[SliceJob], mb_w: usize, mb_h: usize) -> Option<Vec<(usize, usize)>> {
+    if slices.len() < 2 || mb_w == 0 {
+        return None;
+    }
+    let mut bands: Vec<(usize, usize)> = Vec::with_capacity(slices.len());
+    for (k, s) in slices.iter().enumerate() {
+        if !s.sh.slice_type.is_intra() || s.sh.disable_deblocking_filter_idc == 0 {
+            return None;
+        }
+        let first = s.sh.first_mb_in_slice as usize;
+        if !first.is_multiple_of(mb_w) {
+            return None;
+        }
+        let row0 = first / mb_w;
+        let end = match slices.get(k + 1) {
+            Some(n) => n.sh.first_mb_in_slice as usize / mb_w,
+            None => mb_h,
+        };
+        let expected = bands.last().map_or(0, |&(r, n)| r + n);
+        if row0 != expected || end <= row0 || end > mb_h {
+            return None;
+        }
+        bands.push((row0, end - row0));
+    }
+    (bands.last().map_or(0, |&(r, n)| r + n) == mb_h).then_some(bands)
+}
+
+/// A pooled state for a band (or picture) of `rows` rows of `frame`, or a new one.
+fn take_state<S: PoolSample>(shared: &Shared, frame: &FrameRef, row0: usize, rows: usize) -> PicState<S> {
+    let reuse = S::pool(shared).lock().ok().and_then(|mut p| {
+        let i = p.iter().position(|p| p.mb_w == frame.mb_w && p.mb_h == rows && p.planes.fmt == frame.fmt)?;
+        Some(p.swap_remove(i))
+    });
+    match reuse {
+        Some(mut p) => {
+            p.reset_band(frame.clone(), row0);
             p
         }
-        _ => PicState::new(frame.clone()),
-    };
+        None => PicState::new_band(frame.clone(), row0, rows),
+    }
+}
+
+fn give_state<S: PoolSample>(shared: &Shared, pic: PicState<S>) {
+    if let Ok(mut p) = S::pool(shared).lock()
+        && p.len() < STATE_POOL_MAX
+    {
+        p.push(pic);
+    }
+}
+
+/// Decode `slices` into `pic` (a picture, or the band they cover) and publish its rows; a panic
+/// publishes grey rows so that no reader waits forever. Returns the first error.
+fn decode_into<S: PoolSample>(pic: &mut PicState<S>, slices: &[SliceJob], frame: &FrameRef, draft: bool, publish_samples: bool) -> Option<Error> {
     pic.skip_deblock = draft;
-    pic.cancel = Some(shared.cancel.clone());
+    pic.publish_samples = publish_samples;
+    let (row0, rows) = (pic.row0, pic.mb_h);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut first_err = None;
-        for s in &slices {
+        for s in slices {
             if pic.cancelled() {
                 break;
             }
-            if let Err(e) = decode_slice(s, &mut pic) {
+            let r = if row0 == 0 {
+                decode_slice(&s.sh, s, pic)
+            } else {
+                let mut sh = s.sh.clone();
+                sh.first_mb_in_slice = sh.first_mb_in_slice.saturating_sub((row0 * pic.mb_w) as u32);
+                decode_slice(&sh, s, pic)
+            };
+            if let Err(e) = r {
                 first_err.get_or_insert(e);
             }
         }
@@ -631,25 +700,136 @@ fn run_job_typed<S: PoolSample>(frame: FrameRef, slices: Vec<SliceJob>, shared: 
         pic.flush_rows(true);
         first_err
     }));
-    let err = match result {
+    match result {
         Ok(e) => e,
         Err(_) => {
             // Make sure readers never block on this frame.
-            let fallback = Planes::<S>::gray(frame.width, frame.height, frame.fmt);
-            let blank = vec![MbState::default(); frame.mb_w * frame.mb_h()];
-            for r in 0..frame.mb_h() {
-                if !frame.is_published(r) {
-                    frame.publish(r, Frame::make_row(&fallback, r, &blank, &|_, _, _| u32::MAX));
+            let fallback = Planes::<S>::gray(frame.width, rows * 16, frame.fmt);
+            let blank = vec![MbState::default(); frame.mb_w * rows];
+            for r in 0..rows {
+                if !frame.is_published(row0 + r) {
+                    frame.publish(row0 + r, Frame::make_row(&fallback, r, &blank, &|_, _, _| u32::MAX, publish_samples));
                 }
             }
-            pic = PicState::new(frame.clone());
+            *pic = PicState::new_band(frame.clone(), row0, rows);
             Some(Error::Invalid("internal error while decoding a picture".into()))
+        }
+    }
+}
+
+/// The cropped output geometry of a frame, clamped to it: luma (x, y, w) and chroma (x, y, w).
+#[cfg(feature = "threads")]
+struct CropGeom {
+    cx: usize,
+    cy: usize,
+    cw: usize,
+    ccx: usize,
+    ccy: usize,
+    ccw: usize,
+}
+
+/// The output planes of a cropped picture, sized and filled with mid-grey, the output lines
+/// (luma, chroma) each band of `bands` covers, in band order, and the crop geometry.
+#[cfg(feature = "threads")]
+fn band_output<S: Sample>(frame: &Frame, bands: &[(usize, usize)], crop: (usize, usize, usize, usize)) -> ([Vec<S>; 3], Vec<(usize, usize)>, CropGeom) {
+    let (cx, cy, cw, ch) = crop;
+    let (cx, cw) = (cx.min(frame.width), cw.min(frame.width.saturating_sub(cx)));
+    let (cy, ch) = (cy.min(frame.height), ch.min(frame.height.saturating_sub(cy)));
+    let hc = frame.fmt.mb_hc;
+    let (ccy, cch) = if hc == 16 { (cy, ch) } else { (cy / 2, ch.div_ceil(2)) };
+    let (ccx, ccw) = (cx / 2, cw.div_ceil(2));
+    let (ccy, cch) = (ccy.min(frame.cheight), cch.min(frame.cheight.saturating_sub(ccy)));
+    let (ccx, ccw) = (ccx.min(frame.cwidth), ccw.min(frame.cwidth.saturating_sub(ccx)));
+    let mid = S::clip(frame.fmt.mid(), frame.fmt.max());
+    let mut y = S::alloc_plane(cw * ch);
+    y.resize(cw * ch, mid);
+    let mut u = S::alloc_plane(ccw * cch);
+    u.resize(ccw * cch, mid);
+    let mut v = S::alloc_plane(ccw * cch);
+    v.resize(ccw * cch, mid);
+    let lines = bands
+        .iter()
+        .map(|&(row0, rows)| {
+            let (top, bottom) = ((row0 * 16).clamp(cy, cy + ch), ((row0 + rows) * 16).clamp(cy, cy + ch));
+            let (ctop, cbottom) = ((row0 * hc).clamp(ccy, ccy + cch), ((row0 + rows) * hc).clamp(ccy, ccy + cch));
+            (bottom - top, cbottom - ctop)
+        })
+        .collect();
+    ([y, u, v], lines, CropGeom { cx, cy, cw, ccx, ccy, ccw })
+}
+
+/// Decode, deblock and publish one picture with `S` samples, and leave its output planes with the
+/// frame. The slices of an intra picture that allow it ([`band_plan`]) decode as bands at the
+/// same time on the thread pool this runs on (the decoder's own, or the caller's), each band
+/// writing its part of the output planes.
+fn run_job_typed<S: PoolSample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool, crop: (usize, usize, usize, usize)) {
+    let bands = if shared.serial_slices.load(Ordering::Relaxed) { None } else { band_plan(&slices, frame.mb_w, frame.mb_h()) };
+    // a picture of an intra profile is never predicted from: its rows need no sample copies
+    let publish_samples = !slices.first().is_some_and(|s| s.sps.is_intra_profile());
+    let (err, states): (Option<Error>, Vec<PicState<S>>) = match bands {
+        #[cfg(feature = "threads")]
+        Some(bands) if bands.len() > 1 => {
+            use rayon::prelude::*;
+            let (mut planes, lines, g) = band_output::<S>(&frame, &bands, crop);
+            let [p0, p1, p2] = &mut planes;
+            let (mut y, mut u, mut v) = (&mut p0[..], &mut p1[..], &mut p2[..]);
+            let CropGeom { cx, cy, cw, ccx, ccy, ccw } = g;
+            let hc = frame.fmt.mb_hc;
+            let mut parts = Vec::with_capacity(bands.len());
+            for &(ny, nc) in &lines {
+                // (the lengths before the buffers are taken: a receiver is evaluated first)
+                let (ly, lc) = ((ny * cw).min(y.len()), (nc * ccw).min(u.len().min(v.len())));
+                let (py, ry) = std::mem::take(&mut y).split_at_mut(ly);
+                let (pu, ru) = std::mem::take(&mut u).split_at_mut(lc);
+                let (pv, rv) = std::mem::take(&mut v).split_at_mut(lc);
+                parts.push((py, pu, pv));
+                (y, u, v) = (ry, ru, rv);
+            }
+            let results: Vec<(Option<Error>, PicState<S>)> = bands
+                .par_iter()
+                .zip(slices.par_iter())
+                .zip(parts.into_par_iter())
+                .map(|((&(row0, rows), s), (py, pu, pv))| {
+                    let mut pic = take_state::<S>(shared, &frame, row0, rows);
+                    pic.cancel = Some(shared.cancel.clone());
+                    let e = decode_into(&mut pic, std::slice::from_ref(s), &frame, draft, publish_samples);
+                    if e.is_none() && !pic.cancelled() {
+                        // this band's lines of the cropped output, from its own buffers
+                        let top = (row0 * 16).max(cy);
+                        pic.planes.copy_lines(0, top - row0 * 16, cx, cw, py.len() / cw.max(1), py);
+                        let ctop = (row0 * hc).max(ccy);
+                        pic.planes.copy_lines(1, ctop - row0 * hc, ccx, ccw, pu.len() / ccw.max(1), pu);
+                        pic.planes.copy_lines(2, ctop - row0 * hc, ccx, ccw, pv.len() / ccw.max(1), pv);
+                    }
+                    crate::prof::flush_thread();
+                    (e, pic)
+                })
+                .collect();
+            let mut err = None;
+            let mut states = Vec::with_capacity(results.len());
+            for (e, pic) in results {
+                if let Some(e) = e {
+                    err.get_or_insert(e);
+                }
+                states.push(pic);
+            }
+            let out = if shared.cancel.load(Ordering::Relaxed) { None } else { Some(S::wrap_output(planes)) };
+            frame.set_output(out);
+            (err, states)
+        }
+        _ => {
+            let mut pic = take_state::<S>(shared, &frame, 0, frame.mb_h());
+            pic.cancel = Some(shared.cancel.clone());
+            let e = decode_into(&mut pic, &slices, &frame, draft, publish_samples);
+            let out = if e.is_some() || pic.cancelled() { None } else { Some(S::wrap_output(pic.planes.copy_cropped(crop))) };
+            frame.set_output(out);
+            (e, vec![pic])
         }
     };
     if let Ok(mut s) = shared.stats.lock() {
         s.pictures += 1;
         s.draft_pictures += draft as u64;
-        for st in &pic.mbs {
+        for st in states.iter().flat_map(|p| p.mbs.iter()) {
             match st.kind {
                 MbKind::I4x4 => s.mb_i4x4 += 1,
                 MbKind::I8x8 => s.mb_i8x8 += 1,
@@ -669,21 +849,21 @@ fn run_job_typed<S: PoolSample>(frame: FrameRef, slices: Vec<SliceJob>, shared: 
     if let (Some(e), Ok(mut slot)) = (err, shared.error.lock()) {
         slot.get_or_insert(e);
     }
-    if let Ok(mut p) = S::pool(shared).lock()
-        && p.len() < 4
-    {
-        p.push(pic);
+    for pic in states {
+        give_state(shared, pic);
     }
+    crate::prof::flush_thread();
 }
 
-/// Decode the macroblocks of one slice into `pic` (CABAC or CAVLC by the PPS).
-fn decode_slice<S: Sample>(s: &SliceJob, pic: &mut PicState<S>) -> Result<()> {
-    let mut sd = SliceDecoder::new(&s.sh, &s.pps, &s.sps, pic, &s.refs, &s.ls)?;
+/// Decode the macroblocks of one slice into `pic` (CABAC or CAVLC by the PPS); `sh` is the
+/// slice's header, with `first_mb_in_slice` relative to `pic` (a band's first row).
+fn decode_slice<S: Sample>(sh: &SliceHeader, s: &SliceJob, pic: &mut PicState<S>) -> Result<()> {
+    let mut sd = SliceDecoder::new(sh, &s.pps, &s.sps, pic, &s.refs, &s.ls)?;
     if s.pps.entropy_coding_mode {
         sd.decode_cabac(&s.rbsp)
     } else {
         let mut r = BitReader::new(&s.rbsp);
-        r.seek_bits(s.sh.header_bits);
+        r.seek_bits(sh.header_bits);
         sd.decode_cavlc(&mut r)
     }
 }
@@ -709,13 +889,22 @@ fn make_picture(o: &Output<FrameRef>) -> Picture {
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
     let fmt = o.frame.fmt;
     let crop = (cx, cy, cw, ch);
-    let ((y, u, v), wide) = if fmt.wide() {
-        let (y, u, v) = o.frame.copy_cropped::<u16>(crop).unwrap_or_default();
-        ((Vec::new(), Vec::new(), Vec::new()), Some(WidePlanes { y, u, v }))
-    } else {
-        (o.frame.copy_cropped::<u8>(crop).unwrap_or_default(), None)
-    };
     let (ccw, cch) = (cw.div_ceil(2), if fmt.mb_hc == 16 { ch } else { ch.div_ceil(2) });
+    // a picture whose planes could not be made (an internal error, a cancelled job) is mid-grey
+    fn grey<S: Sample>(fmt: Format, (cw, ch, ccw, cch): (usize, usize, usize, usize)) -> (Vec<S>, Vec<S>, Vec<S>) {
+        let mid = S::clip(fmt.mid(), fmt.max());
+        (vec![mid; cw * ch], vec![mid; ccw * cch], vec![mid; ccw * cch])
+    }
+    let sizes = (cw, ch, ccw, cch);
+    let ((y, u, v), wide) = match (o.frame.take_output(), fmt.wide()) {
+        (Some(OutputPlanes::U16([y, u, v])), true) => ((Vec::new(), Vec::new(), Vec::new()), Some(WidePlanes { y, u, v })),
+        (Some(OutputPlanes::U8([y, u, v])), false) => ((y, u, v), None),
+        (_, true) => {
+            let (y, u, v) = o.frame.copy_cropped::<u16>(crop).unwrap_or_else(|| grey(fmt, sizes));
+            ((Vec::new(), Vec::new(), Vec::new()), Some(WidePlanes { y, u, v }))
+        }
+        (_, false) => (o.frame.copy_cropped::<u8>(crop).unwrap_or_else(|| grey(fmt, sizes)), None),
+    };
     Picture {
         wide,
         bit_depth: fmt.bit_depth,
