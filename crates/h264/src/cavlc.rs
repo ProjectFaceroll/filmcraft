@@ -1,7 +1,7 @@
 //! CAVLC residual block parsing (9.2).
 
 use crate::cavlc_tables::{COEFF_TOKEN, RUN_BEFORE, TOTAL_ZEROS_2X2, TOTAL_ZEROS_2X4, TOTAL_ZEROS_4X4};
-use crate::error::{Result, ensure};
+use crate::error::{Result, ensure, invalid};
 use filmcraft_bitstream::BitReader;
 use std::sync::OnceLock;
 
@@ -44,15 +44,21 @@ impl VlcTable {
 }
 
 /// A bit cursor over the slice data for one residual block: [`BitReader`] without a bounds
-/// check per syntax element. Reads past the end of the data see zero bits, which no valid
-/// block ends in; [`Cursor::commit`] refuses a position past the data, so a truncated block
-/// fails there instead. A block reads at most about 1100 bits (coeff_token 16, trailing ones 3,
-/// 16 levels of a prefix of at most 26 bits and a suffix of at most 22, total_zeros 9 and 15
-/// run_before codes of 11), so the position cannot overflow.
+/// check per syntax element. The next bits wait in a 64-bit cache, so a syntax element costs
+/// shifts on a register rather than a load at a bit position, and the cache is topped up a whole
+/// word at a time. Reads past the end of the data see zero bits, which no valid block ends in;
+/// [`Cursor::commit`] refuses a position past the data, so a truncated block fails there
+/// instead. A block reads at most about 1100 bits (coeff_token 16, trailing ones 3, 16 levels of
+/// a prefix of at most 26 bits and a suffix of at most 22, total_zeros 9 and 15 run_before codes
+/// of 11), so the position cannot overflow.
 struct Cursor<'a> {
     data: &'a [u8],
-    /// Position in bits.
-    pos: usize,
+    /// The next unread bits, first bit on top, `count` of them valid and the rest zero.
+    cache: u64,
+    /// Valid bits in `cache`: at least 32 whenever a syntax element is read.
+    count: u32,
+    /// Byte position of the next word to go into the cache.
+    next: usize,
 }
 
 impl<'a> Cursor<'a> {
@@ -60,36 +66,57 @@ impl<'a> Cursor<'a> {
         let data = r.data();
         let pos = r.position();
         ensure!(pos <= data.len() * 8, "unexpected end of bitstream");
-        Ok(Self { data, pos })
+        let mut c = Self { data, cache: 0, count: 0, next: pos >> 3 };
+        c.refill();
+        c.skip((pos & 7) as u32);
+        Ok(c)
+    }
+
+    /// Top the cache up to more than 32 bits with the next word (zero bytes past the end).
+    #[inline(always)]
+    fn refill(&mut self) {
+        if self.count <= 32 {
+            let w = match self.data.get(self.next..).and_then(<[u8]>::first_chunk::<4>) {
+                Some(w) => u32::from_be_bytes(*w),
+                None => {
+                    let mut v = 0u32;
+                    for i in 0..4 {
+                        v = (v << 8) | u32::from(*self.data.get(self.next.saturating_add(i)).unwrap_or(&0));
+                    }
+                    v
+                }
+            };
+            self.cache |= u64::from(w) << (32 - self.count);
+            self.count += 32;
+            self.next = self.next.saturating_add(4);
+        }
+    }
+
+    /// Position in bits.
+    #[inline(always)]
+    fn pos(&self) -> usize {
+        (self.next * 8).saturating_sub(self.count as usize)
     }
 
     /// The next `n` (1..=32) bits, zero-padded past the end.
     #[inline(always)]
     fn peek(&self, n: u32) -> u32 {
-        let byte = self.pos >> 3;
-        let shift = self.pos & 7;
-        // One 8-byte load while at least 8 bytes are left (`shift` <= 7 leaves 57 valid bits).
-        if let Some(w) = self.data.get(byte..).and_then(<[u8]>::first_chunk::<8>) {
-            return ((u64::from_be_bytes(*w) << shift) >> (64 - n)) as u32;
-        }
-        let mut v: u64 = 0;
-        for i in 0..5 {
-            v = (v << 8) | *self.data.get(byte.saturating_add(i)).unwrap_or(&0) as u64;
-        }
-        // v holds 40 bits starting at `byte`
-        ((v << (24 + shift)) >> (64 - n)) as u32
+        (self.cache >> (64 - n)) as u32
     }
 
+    /// Consume `n` (0..=32) bits.
     #[inline(always)]
     fn skip(&mut self, n: u32) {
-        self.pos += n as usize;
+        self.cache <<= n;
+        self.count -= n.min(self.count);
+        self.refill();
     }
 
     /// Read `n` (1..=32) bits.
     #[inline(always)]
     fn bits(&mut self, n: u32) -> u32 {
         let v = self.peek(n);
-        self.pos += n as usize;
+        self.skip(n);
         v
     }
 
@@ -101,15 +128,16 @@ impl<'a> Cursor<'a> {
         let s = if lz >= 16 { 0 } else { ((bits << lz) << 1) >> 27 };
         let e = t.entries[(lz * 32 + s) as usize];
         ensure!(e != 0, "invalid VLC code");
-        self.pos += (e >> 8) as usize;
+        self.skip(u32::from(e >> 8));
         Ok(e as u8)
     }
 
     /// Move `r` to this position; fails when the block read past the end of the data.
     #[inline(always)]
     fn commit(self, r: &mut BitReader<'a>) -> Result<()> {
-        ensure!(self.pos <= self.data.len() * 8, "unexpected end of bitstream");
-        r.seek_bits(self.pos);
+        let pos = self.pos();
+        ensure!(pos <= self.data.len() * 8, "unexpected end of bitstream");
+        r.seek_bits(pos);
         Ok(())
     }
 }
@@ -187,7 +215,9 @@ pub(crate) fn residual_block(
         }
     }
     let mut suffix_length: u32 = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
-    for (i, lv) in level.iter_mut().enumerate().take(total_coeff).skip(trailing_ones) {
+    let Some(rest) = level.get_mut(trailing_ones..total_coeff) else { return invalid("TrailingOnes exceeds TotalCoeff") };
+    for (i, lv) in rest.iter_mut().enumerate() {
+        let i = i + trailing_ones;
         // level_prefix, then the suffix: out of the same 32-bit word when both fit in it
         let w = c.peek(32);
         let level_prefix = w.leading_zeros();

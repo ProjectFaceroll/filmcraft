@@ -224,7 +224,17 @@ pub(crate) struct Scratch<S> {
     pub c_ac: [u8; 2],
     pub pred: [[S; 256]; 2],
     pub pred_c: [[[S; 128]; 2]; 2],
+    /// Reference windows of the block being interpolated: luma (bw + 5) x (bh + 5) at stride
+    /// [`LUMA_WIN`], chroma (bw / 2 + 1) x (bh' + 1) at stride [`CHROMA_WIN`]. Kept here so a
+    /// block does not clear a couple of KiB of stack before overwriting it.
+    pub win: [S; LUMA_WIN * 21],
+    pub cwin: [S; CHROMA_WIN * 17],
 }
+
+/// Stride of the luma reference window ([`Scratch::win`]).
+pub(crate) const LUMA_WIN: usize = 24;
+/// Stride of the chroma reference window ([`Scratch::cwin`]).
+pub(crate) const CHROMA_WIN: usize = 16;
 
 impl<S: Sample> Scratch<S> {
     /// Zeroed scratch buffers, boxed (they are several KiB).
@@ -238,6 +248,8 @@ impl<S: Sample> Scratch<S> {
             c_ac: [0; 2],
             pred: [[S::default(); 256]; 2],
             pred_c: [[[S::default(); 128]; 2]; 2],
+            win: [S::default(); LUMA_WIN * 21],
+            cwin: [S::default(); CHROMA_WIN * 17],
         })
     }
 }
@@ -284,7 +296,8 @@ pub struct SliceDecoder<'a, S> {
 }
 
 /// Interpolate a bw x bh luma block at (px, py) with motion vector `mv` from reference `f` into `y`,
-/// and the corresponding chroma blocks into `c` (stride `cs`). `hc` is the number of chroma lines per
+/// and the corresponding chroma blocks into `c` (stride `cs`), through the reference windows
+/// `win` ([`Scratch::win`], [`Scratch::cwin`]). `hc` is the number of chroma lines per
 /// macroblock: 8 for 4:2:0, 16 for 4:2:2, where chroma has the full luma height and vertical chroma
 /// vectors are in quarter samples (8.4.1.4, 8.4.2.2.2).
 #[inline]
@@ -299,13 +312,14 @@ fn predict_block<S: Sample>(
     cs: usize,
     max: i32,
     hc: usize,
+    win: (&mut [S; LUMA_WIN * 21], &mut [S; CHROMA_WIN * 17]),
 ) {
-    const LW: usize = 24;
-    let mut win = [S::default(); LW * 21];
+    const LW: usize = LUMA_WIN;
+    let (win, cwin) = win;
     let ix = px as i32 + (mv[0] as i32 >> 2);
     let iy = py as i32 + (mv[1] as i32 >> 2);
-    f.luma_window((ix - 2, iy - 2), bw + 5, bh + 5, &mut win, LW);
-    inter::mc_luma_win(&win, LW, McBlock { fx: (mv[0] & 3) as u32, fy: (mv[1] & 3) as u32, bw, bh }, y.0, y.1, max);
+    f.luma_window((ix - 2, iy - 2), bw + 5, bh + 5, win, LW);
+    inter::mc_luma_win(win, LW, McBlock { fx: (mv[0] & 3) as u32, fy: (mv[1] & 3) as u32, bw, bh }, y.0, y.1, max);
     let cx = (px / 2) as i32 + (mv[0] as i32 >> 3);
     let fx = (mv[0] & 7) as u32;
     // 4:2:2: yIntC = yAL / SubHeightC + (mvCLX[1] >> 2), yFracC = (mvCLX[1] & 3) << 1 (8.4.1.4, 8.4.2.2.2)
@@ -316,9 +330,8 @@ fn predict_block<S: Sample>(
     };
     let cw = bw / 2;
     for (comp, out) in c.into_iter().enumerate() {
-        let mut w = [S::default(); 16 * 17];
-        f.chroma_window(comp, (cx, cy), cw + 1, ch + 1, &mut w, 16);
-        inter::mc_chroma_win(&w, 16, McBlock { fx, fy, bw: cw, bh: ch }, out, cs);
+        f.chroma_window(comp, (cx, cy), cw + 1, ch + 1, cwin, CHROMA_WIN);
+        inter::mc_chroma_win(cwin, CHROMA_WIN, McBlock { fx, fy, bw: cw, bh: ch }, out, cs);
     }
 }
 
@@ -844,6 +857,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             let l = if use0 { 0 } else { 1 };
             let f = &self.refs[l][refs[l] as usize].frame;
             let planes = &mut self.pic.planes;
+            let s = &mut *self.s;
             predict_block(
                 f,
                 mvs[l],
@@ -854,6 +868,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                 cs,
                 max,
                 hc,
+                (&mut s.win, &mut s.cwin),
             );
             return;
         }
@@ -864,7 +879,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             }
             let Some(rp) = self.refs[l].get(refs[l] as usize) else { continue };
             let [pc0, pc1] = &mut s.pred_c[l];
-            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8, max, hc);
+            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8, max, hc, (&mut s.win, &mut s.cwin));
         }
         inter::weighted_store(
             &mut self.pic.planes.y[py * ys + px..],

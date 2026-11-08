@@ -604,31 +604,79 @@ impl Frame {
     /// A frame stored with another sample type (only after a format change) reads as mid-grey.
     #[inline]
     pub fn luma_window<S: Sample>(&self, (x0, y0): (i32, i32), w: usize, h: usize, out: &mut [S], os: usize) {
-        let (width, height) = (self.width, self.height);
-        for r in 0..h {
-            let yy = (y0 + r as i32).clamp(0, height as i32 - 1) as usize;
-            let Some(row) = S::row_planes(&self.row(yy >> 4).samples) else {
-                out[r * os..r * os + w].fill(S::clip(self.fmt.mid(), self.fmt.max()));
-                continue;
-            };
-            let line = &row.y[(yy & 15) * width..(yy & 15) * width + width];
-            copy_line::<S, 24>(line, x0, &mut out[r * os..], w);
-        }
+        self.window::<S, 24>((x0, y0), (w, h), (self.width, self.height, 16), |row| S::row_planes(&row.samples).map(|p| &p.y[..]), out, os);
     }
 
     /// Copy the w x h window of chroma component `c` at (x0, y0) (clamped) into `out`.
     #[inline]
     pub fn chroma_window<S: Sample>(&self, c: usize, (x0, y0): (i32, i32), w: usize, h: usize, out: &mut [S], os: usize) {
-        let (cw, ch, hc) = (self.cwidth, self.cheight, self.fmt.mb_hc);
-        for r in 0..h {
-            let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
-            let Some(row) = S::row_planes(&self.row(yy / hc).samples) else {
-                out[r * os..r * os + w].fill(S::clip(self.fmt.mid(), self.fmt.max()));
-                continue;
+        self.window::<S, 16>(
+            (x0, y0),
+            (w, h),
+            (self.cwidth, self.cheight, self.fmt.mb_hc),
+            |row| S::row_planes(&row.samples).map(move |p| if c == 0 { &p.cb[..] } else { &p.cr[..] }),
+            out,
+            os,
+        );
+    }
+
+    /// Copy the `w` x `h` window at (x0, y0) of a plane kept as published rows of `lines_per_row`
+    /// lines (8 or 16) of `stride` samples, `height` lines in all, into `out` (stride `os`),
+    /// replicating the edge samples outside the picture. `plane_of` is the plane of a published
+    /// row (None when the row is kept in another sample type: mid-grey). The window's lines are
+    /// copied a published row at a time, so a row is looked up once and a line costs one
+    /// fixed-size move of `N` samples (`w` <= `N`) when it lies inside the picture.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn window<S: Sample, const N: usize>(
+        &self,
+        (x0, y0): (i32, i32),
+        (w, h): (usize, usize),
+        (stride, height, lines_per_row): (usize, usize, usize),
+        plane_of: impl for<'r> Fn(&'r FrameRow) -> Option<&'r [S]>,
+        out: &mut [S],
+        os: usize,
+    ) {
+        let shift = lines_per_row.trailing_zeros();
+        let mask = lines_per_row.wrapping_sub(1);
+        let maxy = height as i32 - 1;
+        let mid = S::clip(self.fmt.mid(), self.fmt.max());
+        let inside_x = w <= N && x0 >= 0 && (x0 as usize).saturating_add(N) <= stride;
+        let mut r = 0;
+        while r < h {
+            let yy = (y0 + r as i32).clamp(0, maxy) as usize;
+            let mb_row = yy >> shift;
+            // the window lines that read this row: up to its last line, or all that are left when
+            // it is the last row (lines below the picture repeat its last line)
+            let n = if mb_row + 1 >= self.rows.len() {
+                h - r
+            } else {
+                let last = (((mb_row + 1) << shift) as i32 - 1 - y0 + 1).max(0) as usize;
+                last.min(h).saturating_sub(r).max(1)
             };
-            let plane = if c == 0 { &row.cb } else { &row.cr };
-            let line = &plane[(yy % hc) * cw..(yy % hc) * cw + cw];
-            copy_line::<S, 16>(line, x0, &mut out[r * os..], w);
+            let lines = r..(r + n).min(h);
+            match plane_of(self.row(mb_row)) {
+                None => {
+                    for k in lines {
+                        if let Some(dst) = out.get_mut(k * os..).and_then(|d| d.get_mut(..w)) {
+                            dst.fill(mid);
+                        }
+                    }
+                }
+                Some(plane) => {
+                    for k in lines {
+                        let line_y = ((y0 + k as i32).clamp(0, maxy) as usize) & mask;
+                        let Some(line) = plane.get(line_y * stride..).and_then(|l| l.get(..stride)) else { break };
+                        let Some(dst) = out.get_mut(k * os..) else { break };
+                        if inside_x && let (Some(d), Some(src)) = (dst.first_chunk_mut::<N>(), line.get(x0 as usize..).and_then(|l| l.first_chunk::<N>())) {
+                            *d = *src;
+                        } else if let Some(d) = dst.get_mut(..w) {
+                            copy_clamped(line, x0, d);
+                        }
+                    }
+                }
+            }
+            r += n;
         }
     }
 
@@ -670,21 +718,6 @@ pub fn set_plane_allocator(alloc: fn(usize) -> Vec<u8>) {
 /// [`set_plane_allocator`] for the 16-bit planes of high bit depth pictures.
 pub fn set_plane_allocator_u16(alloc: fn(usize) -> Vec<u16>) {
     let _ = PLANE_ALLOCATOR_U16.set(alloc);
-}
-
-/// Copy `w` samples of `line` starting at x0 into `out`; when possible a fixed-size block of `N`
-/// samples is copied instead (cheaper than a variable-length copy; `out` must then have room for `N`).
-#[inline(always)]
-fn copy_line<S: Sample, const N: usize>(line: &[S], x0: i32, out: &mut [S], w: usize) {
-    if w <= N
-        && x0 >= 0
-        && let Some(src) = line.get(x0 as usize..).and_then(|l| l.first_chunk::<N>())
-        && let Some(dst) = out.first_chunk_mut::<N>()
-    {
-        *dst = *src;
-    } else {
-        copy_clamped(line, x0, &mut out[..w]);
-    }
 }
 
 /// Copy `out.len()` samples of `line` starting at x0, replicating edge samples outside the line.
