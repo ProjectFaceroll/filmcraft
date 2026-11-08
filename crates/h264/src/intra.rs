@@ -453,17 +453,24 @@ pub fn pred_chroma<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize
     let (max, mid) = (fmt.max(), fmt.mid());
     let mut top = [0i32; W];
     let mut left = [0i32; 16];
-    if a.top {
-        for i in 0..W {
-            top[i] = plane[(y - 1) * stride + x + i].to_i32();
+    if a.top
+        && let Some(row) = plane.get((y - 1) * stride + x..).and_then(|r| r.first_chunk::<W>())
+    {
+        for (t, s) in top.iter_mut().zip(row) {
+            *t = s.to_i32();
         }
     }
     if a.left {
-        for i in 0..h {
-            left[i] = plane[(y + i) * stride + x - 1].to_i32();
+        for (i, l) in left.iter_mut().enumerate().take(h) {
+            *l = plane.get((y + i) * stride + x - 1).map_or(0, |s| s.to_i32());
         }
     }
     let base = y * stride + x;
+    /// The row `r` of the block as a fixed-size chunk.
+    #[inline(always)]
+    fn row<S: Sample>(plane: &mut [S], base: usize, stride: usize, r: usize) -> Option<&mut [S; W]> {
+        plane.get_mut(base + r * stride..).and_then(|p| p.first_chunk_mut::<W>())
+    }
     match mode {
         0 => {
             for by in 0..h / 4 {
@@ -501,13 +508,19 @@ pub fn pred_chroma<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize
         }
         1 => {
             for r in 0..h {
-                plane[base + r * stride..base + r * stride + W].fill(S::clip(left[r], max));
+                if let Some(line) = row(plane, base, stride, r) {
+                    line.fill(S::clip(left[r], max));
+                }
             }
         }
         2 => {
+            let mut line = [S::default(); W];
+            for (p, &t) in line.iter_mut().zip(&top) {
+                *p = S::clip(t, max);
+            }
             for r in 0..h {
-                for c in 0..W {
-                    plane[base + r * stride + c] = S::clip(top[c], max);
+                if let Some(dst) = row(plane, base, stride, r) {
+                    *dst = line;
                 }
             }
         }
@@ -529,8 +542,10 @@ pub fn pred_chroma<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize
             let b = (34 * hh + 32) >> 6;
             let c = ((34 - 29 * (h == 16) as i32) * v + 32) >> 6;
             for r in 0..h {
-                for cc in 0..W {
-                    plane[base + r * stride + cc] = S::clip((aa + b * (cc as i32 - 3) + c * (r as i32 - 3 - ycf) + 16) >> 5, max);
+                let Some(line) = row(plane, base, stride, r) else { break };
+                let row_term = aa + c * (r as i32 - 3 - ycf) + 16;
+                for (cc, p) in line.iter_mut().enumerate() {
+                    *p = S::clip((row_term + b * (cc as i32 - 3)) >> 5, max);
                 }
             }
         }
