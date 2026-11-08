@@ -1,6 +1,6 @@
 //! Picture buffers and per-macroblock state.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Storage type of decoded samples: `u8` for 8-bit streams (half the memory and cache traffic of
 /// 16-bit storage), `u16` for higher bit depths. Values are always within `0..1 << bit_depth`.
@@ -17,6 +17,10 @@ pub trait Sample: Copy + Default + PartialEq + Eq + std::fmt::Debug + Send + Syn
     fn wrap_row(p: RowPlanes<Self>) -> RowSamples;
     /// An empty output plane with room for `len` samples (see [`set_plane_allocator`]).
     fn alloc_plane(len: usize) -> Vec<Self>;
+    /// Recycled row buffers of this sample type (see [`row_copy`]).
+    fn row_pool() -> &'static Mutex<RowPool<Self>>;
+    /// Output planes (y, u, v) in this sample type.
+    fn wrap_output(planes: [Vec<Self>; 3]) -> OutputPlanes;
     /// Unclipped first-pass result of the 6-tap luma interpolation filter (8.4.2.2.1): `i16` for
     /// 8-bit samples (-2550..=10710 fits, and twice the lanes vectorise), `i32` above.
     type Tap: Copy + Default + Into<i32> + std::fmt::Debug;
@@ -48,7 +52,7 @@ impl Sample for u8 {
     fn row_planes(s: &RowSamples) -> Option<&RowPlanes<u8>> {
         match s {
             RowSamples::U8(p) => Some(p),
-            RowSamples::U16(_) => None,
+            RowSamples::U16(_) | RowSamples::Absent => None,
         }
     }
     fn wrap_row(p: RowPlanes<u8>) -> RowSamples {
@@ -56,6 +60,12 @@ impl Sample for u8 {
     }
     fn alloc_plane(len: usize) -> Vec<u8> {
         PLANE_ALLOCATOR.get().copied().unwrap_or(Vec::with_capacity)(len)
+    }
+    fn row_pool() -> &'static Mutex<RowPool<u8>> {
+        &ROW_POOL_U8
+    }
+    fn wrap_output(planes: [Vec<u8>; 3]) -> OutputPlanes {
+        OutputPlanes::U8(planes)
     }
     type Tap = i16;
     #[inline(always)]
@@ -96,7 +106,7 @@ impl Sample for u16 {
     fn row_planes(s: &RowSamples) -> Option<&RowPlanes<u16>> {
         match s {
             RowSamples::U16(p) => Some(p),
-            RowSamples::U8(_) => None,
+            RowSamples::U8(_) | RowSamples::Absent => None,
         }
     }
     fn wrap_row(p: RowPlanes<u16>) -> RowSamples {
@@ -104,6 +114,12 @@ impl Sample for u16 {
     }
     fn alloc_plane(len: usize) -> Vec<u16> {
         PLANE_ALLOCATOR_U16.get().copied().unwrap_or(Vec::with_capacity)(len)
+    }
+    fn row_pool() -> &'static Mutex<RowPool<u16>> {
+        &ROW_POOL_U16
+    }
+    fn wrap_output(planes: [Vec<u16>; 3]) -> OutputPlanes {
+        OutputPlanes::U16(planes)
     }
     type Tap = i32;
     #[inline(always)]
@@ -194,6 +210,106 @@ impl<S: Sample> Planes<S> {
         p.y.fill(S::clip(fmt.mid(), fmt.max()));
         p
     }
+
+    /// The cropped picture as tightly packed output planes (y, u, v), chroma cropped with the
+    /// picture's subsampling (see [`Frame::copy_cropped`]); a crop outside the picture is clamped.
+    pub fn copy_cropped(&self, (cx, cy, cw, ch): (usize, usize, usize, usize)) -> [Vec<S>; 3] {
+        let (cx, cw) = (cx.min(self.width), cw.min(self.width.saturating_sub(cx)));
+        let (cy, ch) = (cy.min(self.height), ch.min(self.height.saturating_sub(cy)));
+        let mut y = S::alloc_plane(cw * ch);
+        for r in cy..cy + ch {
+            y.extend_from_slice(&self.y[r * self.width + cx..r * self.width + cx + cw]);
+        }
+        let hc = self.fmt.mb_hc;
+        let (ccy, cch) = if hc == 16 { (cy, ch) } else { (cy / 2, ch.div_ceil(2)) };
+        let (ccx, ccw) = (cx / 2, cw.div_ceil(2));
+        let cheight = self.height / 16 * hc;
+        let (ccy, cch) = (ccy.min(cheight), cch.min(cheight.saturating_sub(ccy)));
+        let (ccx, ccw) = (ccx.min(self.cwidth), ccw.min(self.cwidth.saturating_sub(ccx)));
+        let mut u = S::alloc_plane(ccw * cch);
+        let mut v = S::alloc_plane(ccw * cch);
+        for r in ccy..ccy + cch {
+            let o = r * self.cwidth + ccx;
+            u.extend_from_slice(&self.cb[o..o + ccw]);
+            v.extend_from_slice(&self.cr[o..o + ccw]);
+        }
+        [y, u, v]
+    }
+
+    /// Copy `n` lines of plane `c` (0 luma, 1 Cb, 2 Cr) from line `line0`, samples `x0..x0 + w`,
+    /// into `dst` (packed, `w` per line); lines or samples outside the plane are left as they are.
+    pub fn copy_lines(&self, c: usize, line0: usize, x0: usize, w: usize, n: usize, dst: &mut [S]) {
+        let (plane, stride) = match c {
+            0 => (&self.y, self.width),
+            1 => (&self.cb, self.cwidth),
+            _ => (&self.cr, self.cwidth),
+        };
+        for (i, d) in dst.chunks_exact_mut(w).take(n).enumerate() {
+            let o = (line0 + i) * stride + x0;
+            if let Some(src) = plane.get(o..o + w) {
+                d.copy_from_slice(src);
+            }
+        }
+    }
+}
+
+/// Row buffers of finished frames, reused for the rows of the next ones: a 4K 4:2:2 10-bit
+/// picture publishes 33 MB of rows, and fresh allocations of that size cost more in page
+/// faults than the copy itself.
+pub struct RowPool<S> {
+    /// Buffers by length (luma and chroma rows differ; a few lengths at most).
+    buckets: Vec<(usize, Vec<Box<[S]>>)>,
+    bytes: usize,
+}
+
+/// Bytes of row buffers kept per sample type (about four 4K 4:2:2 10-bit pictures).
+const ROW_POOL_BYTES: usize = 160 << 20;
+
+static ROW_POOL_U8: Mutex<RowPool<u8>> = Mutex::new(RowPool { buckets: Vec::new(), bytes: 0 });
+static ROW_POOL_U16: Mutex<RowPool<u16>> = Mutex::new(RowPool { buckets: Vec::new(), bytes: 0 });
+
+/// A copy of `src` in a recycled buffer of the same length when the pool has one.
+fn row_copy<S: Sample>(src: &[S]) -> Box<[S]> {
+    let recycled = {
+        let mut pool = S::row_pool().lock().unwrap_or_else(PoisonError::into_inner);
+        let b = pool.buckets.iter_mut().find(|(len, _)| *len == src.len()).and_then(|(_, rows)| rows.pop());
+        if b.is_some() {
+            pool.bytes = pool.bytes.saturating_sub(std::mem::size_of_val(src));
+        }
+        b
+    };
+    match recycled {
+        Some(mut b) => {
+            b.copy_from_slice(src);
+            b
+        }
+        None => src.into(),
+    }
+}
+
+/// Return a row buffer to the pool (dropped when the pool is full, or when buffers of eight
+/// other lengths are already kept: resolution changes are rare).
+fn row_recycle<S: Sample>(b: Box<[S]>) {
+    let bytes = std::mem::size_of_val(&*b);
+    let mut pool = S::row_pool().lock().unwrap_or_else(PoisonError::into_inner);
+    if pool.bytes.saturating_add(bytes) > ROW_POOL_BYTES {
+        return;
+    }
+    let len = b.len();
+    if let Some((_, rows)) = pool.buckets.iter_mut().find(|(l, _)| *l == len) {
+        rows.push(b);
+    } else if pool.buckets.len() < 8 {
+        pool.buckets.push((len, vec![b]));
+    } else {
+        return;
+    }
+    pool.bytes += bytes;
+}
+
+/// The cropped, tightly packed output planes of a frame, made by the thread that decoded it.
+pub enum OutputPlanes {
+    U8([Vec<u8>; 3]),
+    U16([Vec<u16>; 3]),
 }
 
 /// Macroblock coding category.
@@ -295,6 +411,9 @@ pub struct RowPlanes<S> {
 pub enum RowSamples {
     U8(RowPlanes<u8>),
     U16(RowPlanes<u16>),
+    /// Not kept: the picture is in an intra profile, so no later picture predicts from it, and
+    /// its output planes are made from the decoding buffers. Readers see mid-grey.
+    Absent,
 }
 
 /// One published macroblock row of a decoded frame: final (deblocked) samples plus the motion data
@@ -324,6 +443,24 @@ pub struct Frame {
     pub mb_w: usize,
     pub fmt: Format,
     rows: Box<[OnceLock<FrameRow>]>,
+    /// Set by [`Frame::expect_output`] when a decoding job will leave the output planes here.
+    output_expected: std::sync::atomic::AtomicBool,
+    /// The output planes (None when the job could not make them: the rows are copied instead).
+    output: OnceLock<Mutex<Option<OutputPlanes>>>,
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        for lock in self.rows.iter_mut() {
+            if let Some(row) = lock.take() {
+                match row.samples {
+                    RowSamples::U8(p) => [p.y, p.cb, p.cr].into_iter().for_each(row_recycle),
+                    RowSamples::U16(p) => [p.y, p.cb, p.cr].into_iter().for_each(row_recycle),
+                    RowSamples::Absent => {}
+                }
+            }
+        }
+    }
 }
 
 impl Frame {
@@ -339,7 +476,42 @@ impl Frame {
             mb_w,
             fmt,
             rows: (0..mb_h).map(|_| OnceLock::new()).collect(),
+            output_expected: std::sync::atomic::AtomicBool::new(false),
+            output: OnceLock::new(),
         }
+    }
+
+    /// A decoding job will leave this frame's output planes here ([`Frame::set_output`]).
+    pub fn expect_output(&self) {
+        self.output_expected.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the frame can be output without waiting: its output planes are here, or no job
+    /// makes them and every row is published.
+    pub fn output_ready(&self) -> bool {
+        if self.output_expected.load(std::sync::atomic::Ordering::Acquire) {
+            self.output.get().is_some()
+        } else {
+            self.is_published(self.mb_h().saturating_sub(1))
+        }
+    }
+
+    /// Leave the output planes (None: the picture could not be finished) for [`Frame::take_output`].
+    pub fn set_output(&self, planes: Option<OutputPlanes>) {
+        let _ = self.output.set(Mutex::new(planes));
+    }
+
+    /// The output planes a job left, waiting for them when one was announced; None when the
+    /// caller has to copy the rows itself.
+    pub fn take_output(&self) -> Option<OutputPlanes> {
+        if !self.output_expected.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        #[cfg(feature = "threads")]
+        let cell = self.output.wait();
+        #[cfg(not(feature = "threads"))]
+        let cell = self.output.get()?;
+        cell.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 
     pub fn mb_h(&self) -> usize {
@@ -376,14 +548,19 @@ impl Frame {
     }
 
     /// Build a published row from a contiguous plane set (rows of MB row `r`) and motion data.
-    pub fn make_row<S: Sample>(planes: &Planes<S>, r: usize, mbs: &[MbState], ref_ids: &dyn Fn(&MbState, usize, i8) -> u32) -> FrameRow {
+    pub fn make_row<S: Sample>(planes: &Planes<S>, r: usize, mbs: &[MbState], ref_ids: &dyn Fn(&MbState, usize, i8) -> u32, samples: bool) -> FrameRow {
         let w = planes.width;
         let cw = planes.cwidth;
         let hc = planes.fmt.mb_hc;
         let mb_w = w / 16;
-        let y = planes.y[r * 16 * w..(r + 1) * 16 * w].into();
-        let cb = planes.cb[r * hc * cw..(r + 1) * hc * cw].into();
-        let cr = planes.cr[r * hc * cw..(r + 1) * hc * cw].into();
+        let samples = if samples {
+            let y = row_copy(&planes.y[r * 16 * w..(r + 1) * 16 * w]);
+            let cb = row_copy(&planes.cb[r * hc * cw..(r + 1) * hc * cw]);
+            let cr = row_copy(&planes.cr[r * hc * cw..(r + 1) * hc * cw]);
+            S::wrap_row(RowPlanes { y, cb, cr })
+        } else {
+            RowSamples::Absent
+        };
         let row_mbs = &mbs[r * mb_w..(r + 1) * mb_w];
         let mut mv = [vec![[0i16; 2]; mb_w * 16], vec![[0i16; 2]; mb_w * 16]];
         let mut ref_idx = [vec![-1i8; mb_w * 4], vec![-1i8; mb_w * 4]];
@@ -408,13 +585,7 @@ impl Frame {
         let [mv0, mv1] = mv;
         let [ri0, ri1] = ref_idx;
         let [id0, id1] = ref_id;
-        FrameRow {
-            samples: S::wrap_row(RowPlanes { y, cb, cr }),
-            mv: [mv0.into(), mv1.into()],
-            ref_idx: [ri0.into(), ri1.into()],
-            ref_id: [id0.into(), id1.into()],
-            intra: intra.into(),
-        }
+        FrameRow { samples, mv: [mv0.into(), mv1.into()], ref_idx: [ri0.into(), ri1.into()], ref_id: [id0.into(), id1.into()], intra: intra.into() }
     }
 
     /// A frame with every row published from `planes` and no motion (intra), e.g. "non-existing"
@@ -424,7 +595,7 @@ impl Frame {
         let f = Frame::new(id, poc, mb_w, mb_h, planes.fmt);
         let blank = vec![MbState::default(); mb_w * mb_h];
         for r in 0..mb_h {
-            f.publish(r, Frame::make_row(planes, r, &blank, &|_, _, _| u32::MAX));
+            f.publish(r, Frame::make_row(planes, r, &blank, &|_, _, _| u32::MAX, true));
         }
         f
     }

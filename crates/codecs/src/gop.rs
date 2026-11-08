@@ -1232,7 +1232,9 @@ impl GopCache {
     }
 
     /// Intra-only streams: decode the one sample outside the lock, so several frame workers
-    /// decode different frames of the same source at once.
+    /// decode different frames of the same source at once. The decoding runs on the decode pool
+    /// ([`isolated`]): a decoder that splits a picture into parallel parts (the slices of an
+    /// XAVC Intra picture) spreads them over that pool's threads, not over the caller's.
     fn intra_frame(&self, st: std::sync::MutexGuard<'_, State>, s: &dyn VideoSamples, i: usize, want_pts: i64) -> crate::Result<Taken> {
         let mut st = st;
         let spare = st.spare.pop();
@@ -1241,7 +1243,8 @@ impl GopCache {
             Some(d) => d,
             None => s.make_decoder()?,
         };
-        let res = s.read(i).and_then(|data| {
+        let res = isolated(|| {
+            let data = s.read(i)?;
             DECODED.fetch_add(1, Ordering::Relaxed);
             timed(|| dec.decode(&data, want_pts))
         });

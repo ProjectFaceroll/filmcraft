@@ -41,16 +41,76 @@ impl VlcTable {
         }
         Self { entries }
     }
+}
 
-    #[inline]
-    pub fn decode(&self, r: &mut BitReader) -> Result<u8> {
-        let bits = r.peek(32);
+/// A bit cursor over the slice data for one residual block: [`BitReader`] without a bounds
+/// check per syntax element. Reads past the end of the data see zero bits, which no valid
+/// block ends in; [`Cursor::commit`] refuses a position past the data, so a truncated block
+/// fails there instead. A block reads at most about 1100 bits (coeff_token 16, trailing ones 3,
+/// 16 levels of a prefix of at most 26 bits and a suffix of at most 22, total_zeros 9 and 15
+/// run_before codes of 11), so the position cannot overflow.
+struct Cursor<'a> {
+    data: &'a [u8],
+    /// Position in bits.
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(r: &BitReader<'a>) -> Result<Self> {
+        let data = r.data();
+        let pos = r.position();
+        ensure!(pos <= data.len() * 8, "unexpected end of bitstream");
+        Ok(Self { data, pos })
+    }
+
+    /// The next `n` (1..=32) bits, zero-padded past the end.
+    #[inline(always)]
+    fn peek(&self, n: u32) -> u32 {
+        let byte = self.pos >> 3;
+        let shift = self.pos & 7;
+        // One 8-byte load while at least 8 bytes are left (`shift` <= 7 leaves 57 valid bits).
+        if let Some(w) = self.data.get(byte..).and_then(<[u8]>::first_chunk::<8>) {
+            return ((u64::from_be_bytes(*w) << shift) >> (64 - n)) as u32;
+        }
+        let mut v: u64 = 0;
+        for i in 0..5 {
+            v = (v << 8) | *self.data.get(byte.saturating_add(i)).unwrap_or(&0) as u64;
+        }
+        // v holds 40 bits starting at `byte`
+        ((v << (24 + shift)) >> (64 - n)) as u32
+    }
+
+    #[inline(always)]
+    fn skip(&mut self, n: u32) {
+        self.pos += n as usize;
+    }
+
+    /// Read `n` (1..=32) bits.
+    #[inline(always)]
+    fn bits(&mut self, n: u32) -> u32 {
+        let v = self.peek(n);
+        self.pos += n as usize;
+        v
+    }
+
+    /// Decode one code of `t`.
+    #[inline(always)]
+    fn vlc(&mut self, t: &VlcTable) -> Result<u8> {
+        let bits = self.peek(32);
         let lz = bits.leading_zeros().min(16);
         let s = if lz >= 16 { 0 } else { ((bits << lz) << 1) >> 27 };
-        let e = self.entries[(lz * 32 + s) as usize];
+        let e = t.entries[(lz * 32 + s) as usize];
         ensure!(e != 0, "invalid VLC code");
-        r.skip((e >> 8) as usize)?;
+        self.pos += (e >> 8) as usize;
         Ok(e as u8)
+    }
+
+    /// Move `r` to this position; fails when the block read past the end of the data.
+    #[inline(always)]
+    fn commit(self, r: &mut BitReader<'a>) -> Result<()> {
+        ensure!(self.pos <= self.data.len() * 8, "unexpected end of bitstream");
+        r.seek_bits(self.pos);
+        Ok(())
     }
 }
 
@@ -102,25 +162,29 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
         4..=7 => 2,
         _ => 3,
     };
-    let tok = t.coeff_token[col].decode(r)?;
+    let mut c = Cursor::new(r)?;
+    let tok = c.vlc(&t.coeff_token[col])?;
     let total_coeff = (tok & 31) as usize;
     let trailing_ones = (tok >> 5) as usize;
     if total_coeff == 0 {
+        c.commit(r)?;
         return Ok(0);
     }
     ensure!(total_coeff <= max_num_coeff, "TotalCoeff exceeds maxNumCoeff");
     let mut level = [0i32; 16];
-    let mut suffix_length: u32 = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
-    for (i, lv) in level.iter_mut().enumerate().take(total_coeff) {
-        if i < trailing_ones {
-            *lv = if r.read_bit()? { -1 } else { 1 };
-            continue;
+    if trailing_ones > 0 {
+        // the sign bits of the trailing ones, first one in the top bit
+        let signs = c.bits(trailing_ones as u32);
+        for (i, lv) in level.iter_mut().enumerate().take(trailing_ones) {
+            *lv = if (signs >> (trailing_ones - 1 - i)) & 1 == 1 { -1 } else { 1 };
         }
-        // level_prefix
-        let bits = r.peek(32);
-        let level_prefix = bits.leading_zeros();
+    }
+    let mut suffix_length: u32 = if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
+    for (i, lv) in level.iter_mut().enumerate().take(total_coeff).skip(trailing_ones) {
+        // level_prefix, then the suffix: out of the same 32-bit word when both fit in it
+        let w = c.peek(32);
+        let level_prefix = w.leading_zeros();
         ensure!(level_prefix <= 25, "level_prefix too large");
-        r.skip(level_prefix as usize + 1)?;
         let level_suffix_size = if level_prefix == 14 && suffix_length == 0 {
             4
         } else if level_prefix >= 15 {
@@ -128,7 +192,16 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
         } else {
             suffix_length
         };
-        let level_suffix = if level_suffix_size > 0 { r.read_bits(level_suffix_size)? as i32 } else { 0 };
+        let level_suffix = if level_suffix_size == 0 {
+            c.skip(level_prefix + 1);
+            0
+        } else if level_prefix + 1 + level_suffix_size <= 32 {
+            c.skip(level_prefix + 1 + level_suffix_size);
+            ((w << (level_prefix + 1)) >> (32 - level_suffix_size)) as i32
+        } else {
+            c.skip(level_prefix + 1);
+            c.bits(level_suffix_size) as i32
+        };
         let mut level_code = ((level_prefix.min(15) as i32) << suffix_length) + level_suffix;
         if level_prefix >= 15 && suffix_length == 0 {
             level_code += 15;
@@ -150,9 +223,9 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
     let mut zeros_left = if total_coeff < end_idx - start_idx + 1 {
         let tz_idx = total_coeff - 1;
         let tz = match max_num_coeff {
-            4 => t.total_zeros_2x2[tz_idx].decode(r)?,
-            8 => t.total_zeros_2x4[tz_idx].decode(r)?,
-            _ => t.total_zeros_4x4[tz_idx].decode(r)?,
+            4 => c.vlc(&t.total_zeros_2x2[tz_idx])?,
+            8 => c.vlc(&t.total_zeros_2x4[tz_idx])?,
+            _ => c.vlc(&t.total_zeros_4x4[tz_idx])?,
         } as usize;
         ensure!(tz + total_coeff <= end_idx - start_idx + 1, "total_zeros out of range");
         tz
@@ -167,7 +240,7 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
             break;
         }
         let run = if zeros_left > 0 {
-            let run = t.run_before[zeros_left.min(7) - 1].decode(r)? as usize;
+            let run = c.vlc(&t.run_before[zeros_left.min(7) - 1])? as usize;
             ensure!(run <= zeros_left, "run_before out of range");
             zeros_left -= run;
             run
@@ -176,6 +249,7 @@ pub(crate) fn residual_block(r: &mut BitReader, coeff: &mut [i32], start_idx: us
         };
         pos -= 1 + run;
     }
+    c.commit(r)?;
     Ok(total_coeff as u8)
 }
 

@@ -515,6 +515,12 @@ impl Sps {
     }
 
     /// Number of frames that may precede a frame in decoding order and follow it in output order.
+    /// An intra profile (High 10 / 4:2:2 / 4:4:4 Intra, CAVLC 4:4:4 Intra: AVC-Intra, XAVC
+    /// Intra): every picture is intra coded, so none is used for inter prediction.
+    pub fn is_intra_profile(&self) -> bool {
+        matches!(self.profile_idc, 44 | 100 | 110 | 122 | 244) && self.constraint_flags & 0x10 != 0
+    }
+
     pub fn max_num_reorder_frames(&self) -> usize {
         if let Some(br) = self.vui.as_ref().and_then(|v| v.bitstream_restriction.as_ref()) {
             return br.max_num_reorder_frames as usize;
