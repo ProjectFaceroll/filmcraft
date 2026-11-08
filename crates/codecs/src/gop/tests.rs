@@ -729,11 +729,22 @@ impl VideoSamples for Big {
 fn large_frames_cannot_enlarge_the_gop_cache_ceiling() {
     let mut c = GopCache::new(None);
     c.budget = usize::MAX;
-    assert_eq!(c.cache_budget(1), FRAME_CACHE_CEILING);
-    assert_eq!(c.cache_budget(FRAME_CACHE_CEILING), FRAME_CACHE_CEILING);
+    assert_eq!(c.cache_budget(1, false), FRAME_CACHE_CEILING);
+    assert_eq!(c.cache_budget(FRAME_CACHE_CEILING, false), FRAME_CACHE_CEILING);
     c.budget = 0;
-    assert_eq!(c.cache_budget(4), MIN_FRAMES * 4, "small frames retain the playback reserve");
-    assert_eq!(c.cache_budget(FRAME_CACHE_CEILING), FRAME_CACHE_CEILING, "large frames are capped instead of reserving 64 copies");
+    assert_eq!(c.cache_budget(4, false), MIN_FRAMES * 4, "small frames retain the playback reserve");
+    assert_eq!(c.cache_budget(FRAME_CACHE_CEILING, false), FRAME_CACHE_CEILING, "large frames are capped instead of reserving 64 copies");
+}
+
+#[test]
+fn playback_keeps_the_pipeline_and_prefetch_window_of_large_frames() {
+    let mut c = GopCache::new(None);
+    c.budget = 0;
+    let fb = 33 << 20; // 4K 4:2:2 10-bit
+    assert_eq!(c.cache_budget(fb, false), FRAME_CACHE_CEILING, "paused: 11 pictures");
+    assert_eq!(c.cache_budget(fb, true), PLAY_FRAMES * fb, "playing: the decoder's pipeline and the frames prefetched ahead");
+    assert_eq!(c.cache_budget(200 << 20, true), PLAY_CACHE_CEILING, "huge frames stay bounded");
+    assert_eq!(c.cache_budget(4, true), MIN_FRAMES * 4, "small frames keep their larger reserve");
 }
 
 #[test]
