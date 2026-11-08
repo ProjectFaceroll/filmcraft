@@ -1226,74 +1226,19 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
 
     /// QP'Y: the quantiser used for scaling (8.5.9).
     #[inline]
-    fn qp_prime(&self) -> i32 {
+    pub(crate) fn qp_prime(&self) -> i32 {
         self.qp + self.fmt.qp_bd_offset()
     }
 
     /// QP'C of component `c`.
     #[inline]
-    fn qpc_prime(&self, c: usize) -> i32 {
+    pub(crate) fn qpc_prime(&self, c: usize) -> i32 {
         self.chroma_qp(self.qp, c) + self.fmt.qp_bd_offset()
     }
 
     // ------------------------------------------------------------------------------------------
     // Residual storage helpers (shared by CAVLC and CABAC)
     // ------------------------------------------------------------------------------------------
-
-    fn luma_list4(&self) -> usize {
-        if self.mb().kind.is_intra() { 0 } else { 3 }
-    }
-
-    /// Store a 4x4 luma block given in scan order (levels[0..16]); `ac_only` skips position 0.
-    pub fn put_luma4(&mut self, raster: usize, levels: &[i32; 16], ac_only: bool) {
-        let qp = self.qp_prime();
-        let ls = &self.ls.ls4[self.luma_list4()][(qp % 6) as usize];
-        let blk = &mut self.s.coef[raster * 16..raster * 16 + 16];
-        let dc = !ac_only && levels[0] != 0;
-        if dc {
-            blk[0] = transform::scale4(levels[0], ls[0], qp);
-        }
-        let mut ac = false;
-        for (k, &lv) in levels.iter().enumerate().skip(1) {
-            if lv != 0 {
-                let p = ZIGZAG4[k] as usize;
-                blk[p] = transform::scale4(lv, ls[p], qp);
-                ac = true;
-            }
-        }
-        if dc || ac {
-            self.s.blk_nz |= 1 << raster;
-            self.s.blk_ac |= (ac as u16) << raster;
-            self.pic.mbs[self.mb_addr].nz_mask |= 1 << raster;
-        }
-    }
-
-    /// Store an 8x8 luma block given in scan order.
-    pub fn put_luma8(&mut self, b8: usize, levels: &[i32; 64]) {
-        let qp = self.qp_prime();
-        let list = if self.mb().kind.is_intra() { 0 } else { 1 };
-        let ls = &self.ls.ls8[list][(qp % 6) as usize];
-        let blk = &mut self.s.coef[b8 * 64..b8 * 64 + 64];
-        let dc = levels[0] != 0;
-        if dc {
-            blk[0] = transform::scale8(levels[0], ls[0], qp);
-        }
-        let mut ac = false;
-        for (k, &lv) in levels.iter().enumerate().skip(1) {
-            if lv != 0 {
-                let p = ZIGZAG8[k] as usize;
-                blk[p] = transform::scale8(lv, ls[p], qp);
-                ac = true;
-            }
-        }
-        if dc || ac {
-            self.s.blk_nz |= 1 << b8;
-            self.s.blk_ac |= (ac as u16) << b8;
-            let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-            let m = (0b11u16 << (by * 4 + bx)) | (0b11u16 << ((by + 1) * 4 + bx));
-            self.pic.mbs[self.mb_addr].nz_mask |= m;
-        }
-    }
 
     /// Intra16x16 DC levels in scan order -> scaled DC of each 4x4 block.
     pub fn put_luma_dc(&mut self, levels: &[i32; 16]) {
@@ -1333,26 +1278,6 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                 self.s.coef_c[c][b * 16] = dc;
                 self.s.c_nz[c] |= 1 << b;
             }
-        }
-    }
-
-    /// Chroma AC levels (scan positions 1..16 in levels[1..]) for block `b` of component `c`.
-    pub fn put_chroma_ac(&mut self, c: usize, b: usize, levels: &[i32; 16]) {
-        let qpc = self.qpc_prime(c);
-        let list = if self.mb().kind.is_intra() { 1 + c } else { 4 + c };
-        let ls = &self.ls.ls4[list][(qpc % 6) as usize];
-        let blk = &mut self.s.coef_c[c][b * 16..b * 16 + 16];
-        let mut any = false;
-        for (k, &lv) in levels.iter().enumerate().skip(1) {
-            if lv != 0 {
-                let p = ZIGZAG4[k] as usize;
-                blk[p] = transform::scale4(lv, ls[p], qpc);
-                any = true;
-            }
-        }
-        if any {
-            self.s.c_nz[c] |= 1 << b;
-            self.s.c_ac[c] |= 1 << b;
         }
     }
 

@@ -2,11 +2,13 @@
 //! index derivations).
 
 use crate::cabac::Cabac;
+use crate::cavlc::{Dequant, Sink};
 use crate::error::{Result, ensure, invalid};
 use crate::mbtypes::{MbTypeInfo, Part, SubMbInfo, b_mb_type, b_sub_mb_type, intra_mb_type, p_mb_type, p_sub_mb_type};
 use crate::picture::{MbKind, Sample};
 use crate::slice::SliceType;
 use crate::slicedec::{MbCur, SliceDecoder};
+use crate::tables::{ZIGZAG4, ZIGZAG8};
 
 /// Table 9-43: significant_coeff_flag ctxIdxInc for 8x8 frame blocks.
 #[rustfmt::skip]
@@ -381,10 +383,10 @@ impl<S: Sample> SliceDecoder<'_, S> {
         (st.nnz_c[comp][y * 2 + x] != 0) as usize
     }
 
-    /// residual_block_cabac for ctxBlockCat `cat` (0..=5). Coefficients are written to `coeff`
-    /// in list order (indices 0..max_num). `cbf_inc` is the coded_block_flag ctxIdxInc (ignored for cat 5).
-    /// Returns the number of non-zero coefficients.
-    fn residual_block_cabac(&mut self, c: &mut Cabac, coeff: &mut [i32], cat: usize, max_num: usize, cbf_inc: usize) -> u8 {
+    /// residual_block_cabac for ctxBlockCat `cat` (0..=5). Coefficient `i` of the list
+    /// (0..max_num) goes to `sink.put(i, ..)`. `cbf_inc` is the coded_block_flag ctxIdxInc
+    /// (ignored for cat 5). Returns the number of non-zero coefficients.
+    fn residual_block_cabac<K: Sink + ?Sized>(c: &mut Cabac, sink: &mut K, cat: usize, max_num: usize, cbf_inc: usize) -> u8 {
         if cat != 5 && c.decode_decision(85 + CAT_OFFSET[cat].0 + cbf_inc) == 0 {
             return 0;
         }
@@ -448,7 +450,7 @@ impl<S: Sample> SliceDecoder<'_, S> {
             } else {
                 eq1 += 1;
             }
-            coeff[p as usize] = if c.decode_bypass() == 1 { -abs } else { abs };
+            sink.put(p as usize, if c.decode_bypass() == 1 { -abs } else { abs });
         }
         n as u8
     }
@@ -459,41 +461,55 @@ impl<S: Sample> SliceDecoder<'_, S> {
         let kind = self.mb().kind;
         let intra = kind.is_intra();
         let t8 = self.mb().transform_8x8;
+        let qp = self.qp_prime();
         if kind == MbKind::I16x16 {
             let inc = self.cbf_dc_cond(self.nb[0], 0, intra) + 2 * self.cbf_dc_cond(self.nb[1], 0, intra);
             let mut lv = [0i32; 16];
-            if self.residual_block_cabac(c, &mut lv, 0, 16, inc) > 0 {
+            if Self::residual_block_cabac(c, &mut lv[..], 0, 16, inc) > 0 {
                 self.mb_mut().cbf_dc |= 1;
                 self.put_luma_dc(&lv);
             }
         }
+        // the coefficients are dequantised as they are placed (`Dequant`), straight into the
+        // raster-order scratch blocks
+        let ls4 = &self.ls.ls4[if intra { 0 } else { 3 }][(qp % 6) as usize];
+        let ls8 = &self.ls.ls8[if intra { 0 } else { 1 }][(qp % 6) as usize];
         for b8 in 0..4 {
             let (bx8, by8) = ((b8 & 1) * 2, (b8 >> 1) * 2);
             if cbp & (1 << b8) == 0 {
                 continue;
             }
             if t8 {
-                let mut lv = [0i32; 64];
-                self.residual_block_cabac(c, &mut lv, 5, 64, 0);
+                let Some(out) = self.s.coef.get_mut(b8 * 64..b8 * 64 + 64) else { return invalid("8x8 block out of range") };
+                let mut sink = Dequant::<8> { out, scan: &ZIGZAG8, ls: ls8, qp, stride: 1, phase: 0, ac: false };
+                let n = Self::residual_block_cabac(c, &mut sink, 5, 64, 0);
+                let ac = sink.ac;
                 let st = self.mb_mut();
                 for r in [by8 * 4 + bx8, by8 * 4 + bx8 + 1, (by8 + 1) * 4 + bx8, (by8 + 1) * 4 + bx8 + 1] {
                     st.nnz[r] = 1;
                 }
-                self.put_luma8(b8, &lv);
+                if n > 0 {
+                    self.s.blk_nz |= 1 << b8;
+                    self.s.blk_ac |= (ac as u16) << b8;
+                    let m = (0b11u16 << (by8 * 4 + bx8)) | (0b11u16 << ((by8 + 1) * 4 + bx8));
+                    self.pic.mbs[self.mb_addr].nz_mask |= m;
+                }
             } else {
+                let ac_only = kind == MbKind::I16x16;
                 for i4 in 0..4 {
                     let (bx, by) = (bx8 + (i4 & 1), by8 + (i4 >> 1));
                     let raster = by * 4 + bx;
                     let inc = self.cbf_luma_cond(bx as i32 - 1, by as i32, intra) + 2 * self.cbf_luma_cond(bx as i32, by as i32 - 1, intra);
-                    let mut lv = [0i32; 16];
-                    let n = if kind == MbKind::I16x16 {
-                        self.residual_block_cabac(c, &mut lv[1..], 1, 15, inc)
-                    } else {
-                        self.residual_block_cabac(c, &mut lv, 2, 16, inc)
-                    };
+                    let Some(out) = self.s.coef.get_mut(raster * 16..raster * 16 + 16) else { return invalid("4x4 block out of range") };
+                    let phase = ac_only as usize;
+                    let mut sink = Dequant::<4> { out, scan: &ZIGZAG4, ls: ls4, qp, stride: 1, phase, ac: false };
+                    let n = Self::residual_block_cabac(c, &mut sink, 2 - phase, 16 - phase, inc);
+                    let ac = sink.ac;
                     self.mb_mut().nnz[raster] = n;
                     if n > 0 {
-                        self.put_luma4(raster, &lv, kind == MbKind::I16x16);
+                        self.s.blk_nz |= 1 << raster;
+                        self.s.blk_ac |= (ac as u16) << raster;
+                        self.pic.mbs[self.mb_addr].nz_mask |= 1 << raster;
                     }
                 }
             }
@@ -505,7 +521,7 @@ impl<S: Sample> SliceDecoder<'_, S> {
                 let bit = 1 + comp as u8;
                 let inc = self.cbf_dc_cond(self.nb[0], bit, intra) + 2 * self.cbf_dc_cond(self.nb[1], bit, intra);
                 let mut lv = [0i32; 8];
-                if self.residual_block_cabac(c, &mut lv, 3, nb, inc) > 0 {
+                if Self::residual_block_cabac(c, &mut lv[..], 3, nb, inc) > 0 {
                     self.mb_mut().cbf_dc |= 1 << bit;
                     self.put_chroma_dc(comp, &lv);
                 }
@@ -513,14 +529,20 @@ impl<S: Sample> SliceDecoder<'_, S> {
         }
         if cbp_c == 2 {
             for comp in 0..2 {
+                let qpc = self.qpc_prime(comp);
+                let ls = &self.ls.ls4[if intra { 1 + comp } else { 4 + comp }][(qpc % 6) as usize];
                 for b in 0..nb {
                     let (bx, by) = ((b & 1) as i32, (b >> 1) as i32);
                     let inc = self.cbf_chroma_ac_cond(comp, bx - 1, by, intra) + 2 * self.cbf_chroma_ac_cond(comp, bx, by - 1, intra);
-                    let mut lv = [0i32; 16];
-                    let n = self.residual_block_cabac(c, &mut lv[1..], 4, 15, inc);
+                    let Some(out) = self.s.coef_c.get_mut(comp).and_then(|p| p.get_mut(b * 16..b * 16 + 16)) else {
+                        return invalid("chroma block out of range");
+                    };
+                    let mut sink = Dequant::<4> { out, scan: &ZIGZAG4, ls, qp: qpc, stride: 1, phase: 1, ac: false };
+                    let n = Self::residual_block_cabac(c, &mut sink, 4, 15, inc);
                     self.mb_mut().nnz_c[comp][b] = n;
                     if n > 0 {
-                        self.put_chroma_ac(comp, b, &lv);
+                        self.s.c_nz[comp] |= 1 << b;
+                        self.s.c_ac[comp] |= 1 << b;
                     }
                 }
             }
