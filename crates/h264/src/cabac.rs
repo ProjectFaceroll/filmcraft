@@ -112,15 +112,19 @@ impl<'a> Cabac<'a> {
     #[inline(always)]
     fn refill(&mut self) {
         let b = self.next_byte;
-        let mut w = [0u8; 4];
-        if let Some(src) = self.data.get(b..b + 4) {
-            w.copy_from_slice(src);
-        } else if b < self.data.len() {
-            let n = self.data.len() - b;
-            w[..n].copy_from_slice(&self.data[b..]);
-        }
+        // (a fixed-size chunk: a variable-length copy here became a memcpy call per refill)
+        let w = match self.data.get(b..).and_then(|d| d.first_chunk::<4>()) {
+            Some(w) => u32::from_be_bytes(*w),
+            None => {
+                let mut v = 0u32;
+                for i in 0..4 {
+                    v = (v << 8) | u32::from(*self.data.get(b.saturating_add(i)).unwrap_or(&0));
+                }
+                v
+            }
+        };
         self.next_byte += 4;
-        self.value = (self.value << 32) | u32::from_be_bytes(w) as u64;
+        self.value = (self.value << 32) | u64::from(w);
         self.bits += 32;
     }
 
