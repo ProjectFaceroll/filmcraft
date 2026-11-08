@@ -1,3 +1,4 @@
+mod bands;
 mod common;
 mod conformance;
 mod headers;

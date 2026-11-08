@@ -247,8 +247,10 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   every frame of the GOP. Sequential playback reuses the decoder. An intra-only stream
   (`VideoDecoder::intra_only`: ProRes, DNx, Motion JPEG, and H.264 whose SPS declares an intra
   profile, such as XAVC Intra and AVC-Intra) has no GOP to decode through: the requesting thread
-  decodes the one picture with a decoder of its own, so frame workers decode different pictures
-  at once and a scrub costs one picture, not a pipeline of them. Decoders implement
+  decodes the one picture with a decoder of its own on the decode pool, so frame workers decode
+  different pictures at once and a scrub costs one picture, not a pipeline of them; a decoder
+  that splits a picture into independent parts (the slices of an XAVC Intra picture decode as
+  bands) spreads them over that pool. Decoders implement
   `codecs::VideoDecoder`. `register_video_decoder` puts a factory in front of the built-in ones, so a
   hardware decoder can take precedence. The GOP cache never holds its lock while decoding.
 - **Hardware decoding.** The apps (desktop, CLI / headless MCP, bench) call

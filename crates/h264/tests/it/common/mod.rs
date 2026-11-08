@@ -259,6 +259,26 @@ pub const FIXTURES: &[Fixture] = &[
         filter: NOISE,
         args: &["-profile:v", "baseline", "-x264-params", "slices=4"],
     },
+    // all intra, four row-aligned slices, no deblocking: decoded as parallel bands (the shape of
+    // XAVC Intra / AVC-Intra pictures), with a crop that ends inside the last band
+    Fixture {
+        name: "intra_slices_nodeblock",
+        source: "testsrc2",
+        width: 350,
+        height: 282,
+        frames: 12,
+        filter: NOISE,
+        args: &["-profile:v", "high", "-x264-params", "keyint=1:slices=4:no-deblock=1:cabac=0"],
+    },
+    Fixture {
+        name: "intra_slices_nodeblock_cabac",
+        source: "mandelbrot",
+        width: 350,
+        height: 282,
+        frames: 12,
+        filter: NOISE,
+        args: &["-profile:v", "high", "-x264-params", "keyint=1:slices=4:no-deblock=1"],
+    },
     Fixture {
         name: "keyint10",
         source: "testsrc2",

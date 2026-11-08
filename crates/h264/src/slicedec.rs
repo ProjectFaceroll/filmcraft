@@ -32,7 +32,10 @@ pub struct PicState<S> {
     pub mbs: Vec<MbState>,
     pub slices: Vec<SliceInfo>,
     pub mb_w: usize,
+    /// Macroblock rows of this state: the picture's, or a band of them ([`PicState::new_band`]).
     pub mb_h: usize,
+    /// First picture row of the band (0 for a whole picture).
+    pub row0: usize,
     pub poc: i32,
     pub decoded_mbs: usize,
     pub frame: FrameRef,
@@ -44,6 +47,9 @@ pub struct PicState<S> {
     rows_published: usize,
     /// Draft mode for a non-reference picture: rows are published without deblocking.
     pub skip_deblock: bool,
+    /// Publish the samples of finished rows (off for a picture no later picture predicts from:
+    /// its output is made from these buffers directly).
+    pub publish_samples: bool,
     /// Checked once per macroblock row: when set, slice decoding stops ([`Decoder::reset`]).
     ///
     /// [`Decoder::reset`]: crate::Decoder::reset
@@ -56,15 +62,18 @@ fn mbs_fit(decoded: usize, add: usize, total: usize) -> bool {
 }
 
 impl<S: Sample> PicState<S> {
-    /// Fresh decoding state for `frame`: black planes in its sample format, no macroblocks decoded.
-    pub fn new(frame: FrameRef) -> Self {
-        let (mb_w, mb_h) = (frame.mb_w, frame.mb_h());
+    /// Decoding state for picture rows `row0..row0 + rows` of `frame` alone: the slices of an
+    /// intra picture that do not deblock across their edges decode such bands at the same time.
+    /// Rows outside the band are unavailable, as another slice's macroblocks are.
+    pub fn new_band(frame: FrameRef, row0: usize, rows: usize) -> Self {
+        let (mb_w, mb_h) = (frame.mb_w, rows);
         PicState {
             planes: Planes::new(mb_w * 16, mb_h * 16, frame.fmt),
             mbs: vec![MbState::default(); mb_w * mb_h],
             slices: Vec::new(),
             mb_w,
             mb_h,
+            row0,
             poc: frame.poc,
             decoded_mbs: 0,
             frame,
@@ -73,13 +82,16 @@ impl<S: Sample> PicState<S> {
             rows_deblocked: 0,
             rows_published: 0,
             skip_deblock: false,
+            publish_samples: true,
             cancel: None,
         }
     }
 
-    /// Reuse the buffers of a finished picture of the same size for a new frame.
-    pub fn reset(&mut self, frame: FrameRef) {
-        debug_assert_eq!((self.mb_w, self.mb_h, self.planes.fmt), (frame.mb_w, frame.mb_h(), frame.fmt));
+    /// Reuse the buffers of a finished picture or band of the same size for the band of a new
+    /// frame starting at picture row `row0` (0: the whole picture).
+    pub fn reset_band(&mut self, frame: FrameRef, row0: usize) {
+        debug_assert_eq!((self.mb_w, self.planes.fmt), (frame.mb_w, frame.fmt));
+        self.row0 = row0;
         // start_mb() re-initialises each macroblock before use; only availability must be reset
         for m in &mut self.mbs {
             m.slice_num = u32::MAX;
@@ -142,9 +154,11 @@ impl<S: Sample> PicState<S> {
         while self.rows_deblocked < deblock_limit {
             let r = self.rows_deblocked;
             if !self.skip_deblock {
-                for addr in r * self.mb_w..(r + 1) * self.mb_w {
-                    deblock::deblock_mb(self, addr, self.mb_w);
-                }
+                crate::prof::time(crate::prof::DEBLOCK, || {
+                    for addr in r * self.mb_w..(r + 1) * self.mb_w {
+                        deblock::deblock_mb(self, addr, self.mb_w);
+                    }
+                });
             }
             self.rows_deblocked += 1;
         }
@@ -154,8 +168,8 @@ impl<S: Sample> PicState<S> {
             let slices = &self.slices;
             let ids =
                 |st: &MbState, l: usize, ri: i8| slices.get(st.slice_num as usize).and_then(|s| s.ref_ids[l].get(ri as usize).copied()).unwrap_or(u32::MAX);
-            let row = Frame::make_row(&self.planes, r, &self.mbs, &ids);
-            self.frame.publish(r, row);
+            let row = crate::prof::time(crate::prof::PUBLISH, || Frame::make_row(&self.planes, r, &self.mbs, &ids, self.publish_samples));
+            self.frame.publish(self.row0 + r, row);
             self.rows_published += 1;
         }
     }
@@ -1359,7 +1373,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             ensure!(!self.refs[0].is_empty(), "P_Skip with empty reference list");
             self.derive_p_skip();
         }
-        self.predict_inter();
+        crate::prof::time(crate::prof::INTER_PRED, || self.predict_inter());
         self.prev_qp_delta_nz = false;
         Ok(())
     }
@@ -1503,12 +1517,12 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             self.apply_qp_delta(d)?;
         }
         self.store_qp();
-        self.residual_cavlc(r, cbp)?;
+        crate::prof::time(crate::prof::RESID, || self.residual_cavlc(r, cbp))?;
         if info.kind.is_intra() {
-            self.reconstruct_intra();
+            crate::prof::time(crate::prof::INTRA, || self.reconstruct_intra());
         } else {
-            self.predict_inter();
-            self.reconstruct_inter_residual();
+            crate::prof::time(crate::prof::INTER_PRED, || self.predict_inter());
+            crate::prof::time(crate::prof::INTER_RESID, || self.reconstruct_inter_residual());
         }
         Ok(())
     }
@@ -1609,7 +1623,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                 self.pic.reserve_mbs(run)?;
                 for _ in 0..run {
                     self.start_mb(addr);
-                    self.decode_skip()?;
+                    crate::prof::time(crate::prof::MB, || self.decode_skip())?;
                     self.pic.mb_done(addr)?;
                     addr += 1;
                 }
@@ -1620,7 +1634,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             }
             self.pic.reserve_mbs(1)?;
             self.start_mb(addr);
-            self.decode_mb_cavlc(r)?;
+            crate::prof::time(crate::prof::MB, || self.decode_mb_cavlc(r))?;
             self.pic.mb_done(addr)?;
             addr += 1;
             if !r.more_rbsp_data() {
