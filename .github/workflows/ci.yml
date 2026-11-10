@@ -24,7 +24,11 @@ jobs:
       # Same craft-fonts commit as release.yml.
       craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
       timeout-minutes: 120
-      packages: >-
-        pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev
-        libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev mesa-vulkan-drivers
-        libasound2-dev
+      # Temporary check of #3000 (scrub output thread) on Windows and macOS; this branch is deleted
+      # afterwards and never merged.
+      os: '["windows-latest","macos-latest"]'
+      packages: ""
+      command: >-
+        cargo clippy -p filmcraft -p filmcraft-ui-egui --all-targets --locked -- -D warnings &&
+        cargo test -p filmcraft --locked --bin filmcraft audio &&
+        cargo test -p filmcraft-ui-egui --locked --no-fail-fast -- scrub audio_recovery transport playback
