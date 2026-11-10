@@ -370,29 +370,67 @@ impl GpuPlan {
 
 /// Finished plans, bounded by count and bytes.
 ///
-/// Over the budget, plans that have been shown go first (least recently shown first), then
-/// unshown ones from the oldest (a plan that finished too late for its frame stays unshown
-/// behind the playhead), and never below `min` plans. While playing, the plans
-/// prefetched ahead of the playhead have not been shown yet, so least-recently-used eviction
-/// over the whole cache took exactly the frame due next, and `BUDGET` holds 15 plans of a 4K
-/// 4:2:2 10-bit sequence (~66 MB each: the frame and its texture), fewer than the prefetch
-/// depth plus the jobs in flight. FX6 XAVC-I playback at 50 fps showed 229 of 400 frames
-/// that way, with 93% of them finished before they were due; with the window kept, 352.
+/// Over the budget the least recently used plan goes first (made, or taken for display), but
+/// the plans a playing monitor shows and is about to show stay ([`PlayWindow`]), and the cache
+/// never drops below `min` plans. While playing, the plans prefetched ahead of the playhead
+/// have not been used since they were made, so least-recently-used eviction over the whole
+/// cache took exactly the frame due next, and `BUDGET` holds 15 plans of a 4K 4:2:2 10-bit
+/// sequence (~66 MB each: the frame and its texture), fewer than the prefetch depth plus the
+/// jobs in flight. FX6 XAVC-I playback at 50 fps showed 229 of 400 frames that way, with 93%
+/// of them finished before they were due; with the window kept, 352.
+///
+/// The window is told to the cache, not guessed from which plans were shown. Evicting every
+/// shown plan before any plan never shown kept the frames ahead too, but plans never shown
+/// collect behind the playhead as well (a frame that finished after it was due, the frames
+/// prefetched past the point where the last play stopped). Once those filled the cache, the
+/// plan on screen was the only shown one and went at the next insert. Its frame was still due
+/// at the next refresh (50 fps on a 60 Hz display shows every fifth frame twice), was missing,
+/// and the monitor showed the nearest plan behind it instead: a frame from four to eleven
+/// frames earlier, for one refresh (FX3 XAVC S long-GOP: 15 times in a 9 s play).
 struct PlanCache {
     map: HashMap<FrameKey, PlanEntry>,
     clock: u64,
     bytes: usize,
+    /// Bytes of plans kept at most ([`PlanCache::BUDGET`]; a test's own).
+    budget: usize,
     /// Plans kept whatever their bytes: the prefetch window plus the jobs in flight
     /// ([`PlanCache::new`]).
     min: usize,
+    /// The frames the playing monitor shows and is about to show, while one plays plans.
+    window: Option<PlayWindow>,
 }
 
 struct PlanEntry {
     plan: Arc<GpuPlan>,
-    /// The clock when the plan was last taken for display; None until it is.
-    shown: Option<u64>,
-    inserted: u64,
+    /// The clock when the plan was made or last taken for display.
+    used: u64,
     bytes: usize,
+}
+
+/// How many frames behind the frame due a [`PlayWindow`] reaches: the frame on screen when the
+/// frame due is not ready yet, and the one before it.
+const WINDOW_BEHIND: i64 = 2;
+
+/// The plans a playing monitor shows and is about to show: the frame due (`key`), the
+/// [`WINDOW_BEHIND`] frames before it and the `ahead` frames after it that its prefetch asks
+/// for, counted in the direction of play (`dir`: 1, or -1 in reverse).
+#[derive(Clone, Copy)]
+struct PlayWindow {
+    key: FrameKey,
+    dir: i64,
+    ahead: i64,
+}
+
+impl PlayWindow {
+    /// How many frames after the frame due `k` plays (negative: before it), when `k` is one of
+    /// the window's plans.
+    fn offset(&self, k: &FrameKey) -> Option<i64> {
+        if (FrameKey { frame: self.key.frame, ..*k }) != self.key {
+            return None;
+        }
+        let d = k.frame.checked_sub(self.key.frame)?.checked_mul(self.dir)?;
+        (-WINDOW_BEHIND..=self.ahead).contains(&d).then_some(d)
+    }
 }
 
 impl PlanCache {
@@ -403,14 +441,14 @@ impl PlanCache {
     /// may finish while it is full (and a couple of frames of slack).
     fn new(workers: usize) -> Self {
         let min = (prefetch_depth(2.0) as usize).saturating_add(workers).saturating_add(2).min(Self::MAX);
-        PlanCache { map: HashMap::new(), clock: 0, bytes: 0, min }
+        PlanCache { map: HashMap::new(), clock: 0, bytes: 0, budget: Self::BUDGET, min, window: None }
     }
 
     fn get(&mut self, k: &FrameKey) -> Option<Arc<GpuPlan>> {
         self.clock += 1;
         let clock = self.clock;
         self.map.get_mut(k).map(|e| {
-            e.shown = Some(clock);
+            e.used = clock;
             e.plan.clone()
         })
     }
@@ -418,17 +456,19 @@ impl PlanCache {
     fn insert(&mut self, k: FrameKey, p: GpuPlan) {
         self.clock += 1;
         let bytes = p.bytes();
-        self.bytes += bytes;
-        if let Some(old) = self.map.insert(k, PlanEntry { plan: Arc::new(p), shown: None, inserted: self.clock, bytes }) {
-            self.bytes -= old.bytes;
+        self.bytes = self.bytes.saturating_add(bytes);
+        if let Some(old) = self.map.insert(k, PlanEntry { plan: Arc::new(p), used: self.clock, bytes }) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
         }
-        if self.map.len() > Self::MAX || self.bytes > Self::BUDGET {
-            let mut v: Vec<(FrameKey, Option<u64>, u64, usize)> = self.map.iter().map(|(k, e)| (*k, e.shown, e.inserted, e.bytes)).collect();
+        if self.map.len() > Self::MAX || self.bytes > self.budget {
+            let window = self.window;
+            let mut v: Vec<(FrameKey, u64, Option<i64>, usize)> =
+                self.map.iter().map(|(k, e)| (*k, e.used, window.and_then(|w| w.offset(k)), e.bytes)).collect();
             sort_for_eviction(&mut v);
             for (k, _, _, b) in v {
-                if self.map.len() > Self::MAX || (self.bytes > Self::BUDGET && self.map.len() > self.min) {
+                if self.map.len() > Self::MAX || (self.bytes > self.budget && self.map.len() > self.min) {
                     self.map.remove(&k);
-                    self.bytes -= b;
+                    self.bytes = self.bytes.saturating_sub(b);
                 } else {
                     break;
                 }
@@ -437,12 +477,13 @@ impl PlanCache {
     }
 }
 
-/// Order `(key, shown, inserted, bytes)` entries for eviction (see [`PlanCache`]): shown
-/// entries first, least recently shown first, then unshown entries from the oldest.
-fn sort_for_eviction<K>(v: &mut [(K, Option<u64>, u64, usize)]) {
-    v.sort_unstable_by_key(|&(_, shown, inserted, _)| match shown {
-        Some(t) => (0u8, t),
-        None => (1, inserted),
+/// Order `(key, used, offset in the play window, bytes)` entries for eviction (see
+/// [`PlanCache`]): the plans outside the window first, least recently used first, then the
+/// window's own from the one due last.
+fn sort_for_eviction<K>(v: &mut [(K, u64, Option<i64>, usize)]) {
+    v.sort_unstable_by_key(|&(_, used, offset, _)| match offset {
+        None => (0u8, used, 0i64),
+        Some(d) => (1, 0, d.saturating_neg()),
     });
 }
 
@@ -856,6 +897,11 @@ impl FrameServer {
         let step = speed.abs().max(1.0) as i64;
         let fps = rate.as_f64() * speed.abs().max(1.0) / step as f64;
         let (lead, stride) = if preroll { (1, 1) } else { playback_plan(self.render_cost(), fps, self.shared.workers) };
+        if matches!(key.target, Target::SequencePlan(..)) {
+            // the plans this play shows next are the last the plan cache gives up ([`PlayWindow`])
+            let ahead = prefetch_depth(speed).saturating_mul(stride).saturating_add(lead).saturating_mul(step);
+            self.shared.plans.lock().unwrap_or_else(PoisonError::into_inner).window = Some(PlayWindow { key, dir, ahead });
+        }
         if lead <= 1 {
             // the frame due now; once the clock runs, the frames before it are late
             self.request_job(FrameRequest {
@@ -959,6 +1005,7 @@ impl FrameServer {
     /// they would keep the workers busy, e.g. rendering effects for frames nobody will see).
     pub fn stop_prefetch(&self) {
         self.shared.dropped.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.shared.plans.lock().unwrap_or_else(PoisonError::into_inner).window = None;
         self.shared.queue.lock().unwrap_or_else(PoisonError::into_inner).retain(|j| !j.prefetch);
         self.shared.uploads.lock().unwrap_or_else(PoisonError::into_inner).retain(|j| !j.prefetch);
         for (_, c, prefetch) in self.shared.in_flight.lock().unwrap_or_else(PoisonError::into_inner).iter() {
@@ -1449,21 +1496,136 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
 #[cfg(test)]
 mod tests {
     #[test]
-    fn plan_eviction_spares_the_prefetch_window() {
-        // frames 1..=3 shown (3 most recently), 4..=8 made in order: the shown ones go first,
-        // oldest shown first, then the unshown ones from the oldest
+    fn plan_eviction_spares_the_play_window() {
+        // 1..=3 lie outside the window (3 used most recently); 4 is on screen, 5 is due and
+        // 6..=8 are ahead of it, all made before 1..=3 were last used: the ones outside go
+        // first, least recently used first, then the window's from the one due last
         let mut v = vec![
-            (4u32, None, 14u64, 1usize),
-            (1, Some(21), 11, 1),
-            (8, None, 18, 1),
-            (2, Some(22), 12, 1),
-            (6, None, 16, 1),
-            (3, Some(23), 13, 1),
-            (5, None, 15, 1),
-            (7, None, 17, 1),
+            (4u32, 14u64, Some(-1i64), 1usize),
+            (1, 21, None, 1),
+            (8, 18, Some(3), 1),
+            (2, 22, None, 1),
+            (6, 16, Some(1), 1),
+            (3, 23, None, 1),
+            (5, 15, Some(0), 1),
+            (7, 17, Some(2), 1),
         ];
         super::sort_for_eviction(&mut v);
-        assert_eq!(v.iter().map(|e| e.0).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(v.iter().map(|e| e.0).collect::<Vec<_>>(), [1, 2, 3, 8, 7, 6, 5, 4]);
+    }
+
+    fn plan_key(frame: i64) -> FrameKey {
+        FrameKey { target: Target::SequencePlan(ItemId(1), filmcraft_render::plan::DeviceCaps::NONE), frame, size: 1000, revision: 0, draft: false }
+    }
+
+    fn small_plan() -> super::GpuPlan {
+        super::GpuPlan { plan: filmcraft_render::plan::FramePlan::Image(filmcraft_render::Image::new(2, 2)), prepared: Default::default(), deferred: false }
+    }
+
+    /// A plan cache over its budget from the first plan, so that only `min` and the play window
+    /// decide what stays.
+    fn full_plan_cache(workers: usize) -> super::PlanCache {
+        super::PlanCache { budget: 1, ..super::PlanCache::new(workers) }
+    }
+
+    /// The monitor of a play at 1x takes the frame `due` for a refresh; whether it was there.
+    fn shown(cache: &mut super::PlanCache, due: i64) -> bool {
+        cache.window = Some(super::PlayWindow { key: plan_key(due), dir: 1, ahead: super::prefetch_depth(1.0) + 1 });
+        cache.get(&plan_key(due)).is_some()
+    }
+
+    /// What reaches the cache between two refreshes of that play: the frames ahead of `due`, up
+    /// to the prefetch depth, that are not there yet, and from the upload thread one of them
+    /// again, now uploaded ([`UPLOAD_AHEAD`]).
+    fn deliver(cache: &mut super::PlanCache, due: i64) {
+        for f in due + 1..=due + super::prefetch_depth(1.0) {
+            if !cache.map.contains_key(&plan_key(f)) {
+                cache.insert(plan_key(f), small_plan());
+            }
+        }
+        cache.insert(plan_key(due + i64::from(UPLOAD_AHEAD)), small_plan());
+    }
+
+    /// Play frames `from..to` at 50 fps on a 60 Hz display at its worst: every frame is due for
+    /// two refreshes, and must be there at both.
+    fn play(cache: &mut super::PlanCache, from: i64, to: i64) {
+        for due in from..to {
+            assert!(shown(cache, due), "frame {due} was not there when due");
+            deliver(cache, due);
+            assert!(shown(cache, due), "frame {due} was gone at its second refresh");
+            deliver(cache, due);
+        }
+    }
+
+    /// The frames prefetched past the point where a play stopped are never shown. A later play
+    /// used to lose the plan on screen to them: every shown plan was evicted before any unshown
+    /// one, so with the cache full of unshown plans the frame on screen went at the next insert
+    /// and was missing at the next refresh, where 50 fps on a 60 Hz display shows it again.
+    #[test]
+    fn the_plan_on_screen_outlives_plans_left_over_from_an_earlier_play() {
+        let mut cache = full_plan_cache(2);
+        // an earlier play stopped at frame 1000 with its prefetch run decoded
+        for f in 1000..1000 + 24 {
+            cache.insert(plan_key(f), small_plan());
+        }
+        cache.insert(plan_key(0), small_plan());
+        play(&mut cache, 0, 60);
+        // the leftovers went instead, and the frames ahead are all there
+        assert!((1000..1024).all(|f| !cache.map.contains_key(&plan_key(f))), "plans of the earlier play outlived this play's");
+        assert!((60..60 + super::prefetch_depth(1.0)).all(|f| cache.map.contains_key(&plan_key(f))));
+    }
+
+    /// A frame that finished after the playhead passed it lies behind the play window: it goes
+    /// before the plan on screen does, and the monitor has no older frame to fall back on.
+    #[test]
+    fn a_plan_that_finished_late_goes_before_the_plan_on_screen() {
+        let mut cache = full_plan_cache(2);
+        cache.insert(plan_key(0), small_plan());
+        play(&mut cache, 0, 40);
+        // frames 30 and 31 were dropped and arrive now, with the playhead on 40; so do a
+        // cache's worth of others through the play
+        for late in 0..40 {
+            cache.insert(plan_key(late), small_plan());
+            play(&mut cache, 40 + late, 41 + late);
+        }
+        play(&mut cache, 80, 140);
+        assert!((0..40).all(|f| !cache.map.contains_key(&plan_key(f))), "the late plans are still cached");
+    }
+
+    /// Stopped (scrubbing, stepping), nothing plays and the cache is least-recently-used again.
+    #[test]
+    fn without_a_play_window_the_least_recently_used_plan_goes_first() {
+        let mut cache = full_plan_cache(0);
+        let min = cache.min as i64;
+        for f in 0..min {
+            cache.insert(plan_key(f), small_plan());
+        }
+        assert!(cache.get(&plan_key(0)).is_some());
+        cache.insert(plan_key(min), small_plan());
+        assert!(cache.map.contains_key(&plan_key(0)), "the plan just shown stays");
+        assert!(!cache.map.contains_key(&plan_key(1)), "the oldest unused plan goes");
+    }
+
+    #[test]
+    fn a_play_window_holds_the_frames_around_the_frame_due_in_the_direction_of_play() {
+        let w = super::PlayWindow { key: plan_key(100), dir: 1, ahead: 15 };
+        assert_eq!(w.offset(&plan_key(100)), Some(0));
+        assert_eq!(w.offset(&plan_key(98)), Some(-2));
+        assert_eq!(w.offset(&plan_key(97)), None);
+        assert_eq!(w.offset(&plan_key(115)), Some(15));
+        assert_eq!(w.offset(&plan_key(116)), None);
+        // another revision, size or sequence is another picture
+        assert_eq!(w.offset(&FrameKey { revision: 1, ..plan_key(101) }), None);
+        assert_eq!(w.offset(&FrameKey { size: 500, ..plan_key(101) }), None);
+        assert_eq!(w.offset(&FrameKey { target: Target::Sequence(ItemId(1)), ..plan_key(101) }), None);
+        // in reverse the frames about to be shown are the lower ones
+        let back = super::PlayWindow { key: plan_key(100), dir: -1, ahead: 15 };
+        assert_eq!(back.offset(&plan_key(90)), Some(10));
+        assert_eq!(back.offset(&plan_key(102)), Some(-2));
+        assert_eq!(back.offset(&plan_key(103)), None);
+        // hostile frame numbers neither overflow nor match
+        assert_eq!(w.offset(&plan_key(i64::MIN)), None);
+        assert_eq!(super::PlayWindow { key: plan_key(i64::MAX), dir: -1, ahead: 15 }.offset(&plan_key(i64::MIN)), None);
     }
 
     #[test]
